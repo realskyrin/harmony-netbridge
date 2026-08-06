@@ -43,7 +43,7 @@ export class GateTunnel {
       const hello: HelloPayload = {
         role: 'control',
         mode: 'phase1',
-        appVersion: '0.3.0-gatev',
+        appVersion: '0.4.0-gatev',
         supportedVersions: [1],
         capabilities: ['control', 'gate-v'],
         message: 'hello'

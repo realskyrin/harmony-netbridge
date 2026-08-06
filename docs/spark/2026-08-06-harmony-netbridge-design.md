@@ -1,6 +1,6 @@
 # HarmonyNetBridge 技术方案设计文档
 
-> 状态：已批准；Phase 1、Gate V、Phase 2 IPv4 MVP 与 Phase 3 单设备稳定性能力已按本设计实施
+> 状态：已批准；Phase 1、Gate V、Phase 2 IPv4 MVP、Phase 3 单设备稳定性与 Phase 4 mitmweb 抓包能力已按本设计实施
 >
 > 日期：2026-08-06
 >
@@ -59,10 +59,12 @@ HarmonyNetBridge Lite：显式 HTTP/SOCKS 代理桥
                     ↓
 Phase 2：完整 IPv4 TCP/UDP/DNS VPN Relay
                     ↓
-Phase 3：稳定性、配置化、重连、多设备和 IPv6
+Phase 3：稳定性、MTU、心跳和单设备重连
                     ↓
-Phase 4：mitmproxy/Charles 开发体验自动化
+Phase 4：受管 mitmweb 开发体验自动化
 ```
+
+实施时按用户确认缩小了 Phase 3：不支持多设备，IPv6 也未并入当前 MVP；二者不能从阶段名称推断为已完成。
 
 ## 3. 证据基线
 
@@ -754,8 +756,8 @@ Gate V 失败时必须记录具体系统错误和设备条件。Lite 仍可继�
 - Gate V 真实 TUN packet。
 - Phase 2 TCP、UDP、企业 split DNS 和 AnyConnect 内网访问。
 - 录制设备请求、Mac Relay 事件和服务器响应的关联证据。
-- Phase 3 重连、MTU、心跳、多设备隔离、IPv6 和资源稳定性。
-- Phase 4 mitmproxy/Charles HTTP 与 HTTPS 抓包；分别记录应用内 CA、手动证书和不可用场景。
+- Phase 3 重连、MTU、心跳和单设备资源稳定性。
+- Phase 4 mitmweb HTTP 与 HTTPS 抓包；分别记录手动 CA 与不可用场景。
 
 每个阶段完成后必须交付：实现说明、实际运行过的测试、未运行或失败的测试、下一阶段计划。静态检查不能表述为运行时验证。
 
@@ -796,8 +798,10 @@ Gate V 失败时必须记录具体系统错误和设备条件。Lite 仍可继�
 2. Gate V 在物理设备上验证第三方 VPN 授权、`protect()`、受限路由、TUN read 与 `destroy()`。
 3. Gate 通过后才启用默认 IPv4 路由，并实现独立 Control/Data、Native PacketPump 与 gVisor relay。
 4. Phase 2 的实现、当前真机证据和未验证边界单独记录在 [`docs/phase-2.md`](../phase-2.md)。
+5. Phase 3 的单设备稳定性实现与真机恢复证据记录在 [`docs/phase-3.md`](../phase-3.md)。
+6. Phase 4 的受管 mitmweb、手动 CA 信任边界与独立验收记录在 [`docs/phase-4.md`](../phase-4.md)。
 
-Phase 3 与 Phase 4 仍需独立验收，不能把当前 IPv4 MVP 表述为已完成重连、多设备、IPv6或抓包自动化。
+当前不能表述为已支持多设备、IPv6、任意 TCP 协议抓包或绕过证书 pinning；这些仍是明确边界。
 
 ## 22. 参考资料
 

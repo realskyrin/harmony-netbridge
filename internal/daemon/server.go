@@ -3,15 +3,20 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -36,6 +41,9 @@ const (
 	controlRequestTimeout    = 5 * time.Second
 	controlStopAckTimeout    = 2 * time.Second
 	cleanupTimeout           = 5 * time.Second
+	certificateDownloadPath  = "/mitmproxy-ca-cert.cer"
+	maxCertificateBytes      = 64 * 1024
+	maxHTTPRequestBytes      = 8 * 1024
 )
 
 // Forwarder is the narrow hdc capability owned by the daemon.
@@ -55,6 +63,23 @@ type PacketRelay interface {
 // RelayFactory creates a fresh relay for each authenticated data connection.
 type RelayFactory func() (PacketRelay, error)
 
+// ProxySession is the narrow lifecycle and dial boundary exposed by the
+// project-owned mitmweb supervisor.
+type ProxySession interface {
+	Info() state.ProxySnapshot
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	Done() <-chan struct{}
+	Err() error
+	Close() error
+}
+
+// ProxyFactory starts a new local capture process after orphan recovery.
+type ProxyFactory func(previous state.ProxySnapshot) (ProxySession, error)
+
+// ProxyRecovery removes an exactly identified orphan even when the next daemon
+// is switching back to standard forwarding mode.
+type ProxyRecovery func(previous state.ProxySnapshot) error
+
 // Config contains all external daemon dependencies.
 type Config struct {
 	Paths             runtimepath.Paths
@@ -69,6 +94,8 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
 	RelayFactory      RelayFactory
+	ProxyFactory      ProxyFactory
+	ProxyRecovery     ProxyRecovery
 }
 
 // Server supervises a single selected hdc target.
@@ -95,6 +122,7 @@ type Server struct {
 	deviceListener  net.Listener
 	mapping         hdc.Mapping
 	mappingAdded    bool
+	proxySession    ProxySession
 
 	// These hooks are nil in production and let package tests pause the two
 	// sides of a data-handshake/control-loss race at deterministic boundaries.
@@ -195,15 +223,6 @@ func New(config Config) (*Server, error) {
 	if config.HeartbeatTimeout <= config.HeartbeatInterval {
 		config.HeartbeatTimeout = 3 * config.HeartbeatInterval
 	}
-	if config.RelayFactory == nil {
-		config.RelayFactory = func() (PacketRelay, error) {
-			return packetrelay.New(packetrelay.Config{
-				Logger: config.Logger,
-				DNS:    packetrelay.NewSystemDNS(config.Logger),
-				MTU:    uint32(config.MTU),
-			})
-		}
-	}
 	return &Server{config: config, stopRequested: make(chan struct{})}, nil
 }
 
@@ -229,8 +248,9 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 	}
 	s.controlListener = controlListener
 	initialState := state.NewStarting(s.now(), s.config.DeviceLabel, s.config.DevicePort)
+	previousState, _ := state.ReadFile(s.config.Paths.StateFile)
 	var staleMapping *hdc.Mapping
-	if previousState, readError := state.ReadFile(s.config.Paths.StateFile); readError == nil &&
+	if previousState.Device != "" &&
 		previousState.Device == s.config.DeviceLabel && previousState.DevicePort == s.config.DevicePort {
 		if previousState.Daemon == state.DaemonRunning {
 			initialState.Reconnects = previousState.Reconnects + 1
@@ -244,6 +264,10 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 	s.store = state.NewStore(initialState)
 	s.store.Update(s.now(), func(snapshot *state.Snapshot) {
 		snapshot.MTU = s.config.MTU
+		if s.config.ProxyFactory != nil {
+			snapshot.Proxy = state.ProxySnapshot{Enabled: true, Status: state.ProxyStarting}
+			snapshot.Message = "Starting the local capture proxy"
+		}
 	})
 	if err := s.persist(); err != nil {
 		_ = controlListener.Close()
@@ -257,6 +281,33 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 			runError = cleanupError
 		}
 	}()
+	if previousState.Proxy.Enabled && s.config.ProxyRecovery != nil {
+		if proxyError := s.config.ProxyRecovery(previousState.Proxy); proxyError != nil {
+			s.update(func(snapshot *state.Snapshot) {
+				snapshot.Proxy = previousState.Proxy
+				snapshot.Proxy.Status = state.ProxyFailed
+			})
+			s.fail(apperror.CodeProxyUnavailable, "an orphaned capture proxy could not be safely recovered")
+			return apperror.Wrap(apperror.CodeProxyUnavailable,
+				"an orphaned capture proxy could not be safely recovered", proxyError)
+		}
+	}
+	if s.config.ProxyFactory != nil {
+		proxySession, proxyError := s.config.ProxyFactory(previousState.Proxy)
+		if proxyError != nil {
+			s.update(func(snapshot *state.Snapshot) {
+				snapshot.Proxy.Status = state.ProxyFailed
+			})
+			s.fail(apperror.CodeProxyUnavailable, "the local capture proxy could not be started")
+			return apperror.Wrap(apperror.CodeProxyUnavailable, "the local capture proxy could not be started", proxyError)
+		}
+		s.proxySession = proxySession
+		proxyInfo := proxySession.Info()
+		s.update(func(snapshot *state.Snapshot) {
+			snapshot.Proxy = proxyInfo
+			snapshot.Message = "Local capture proxy ready; preparing the USB bridge"
+		})
+	}
 
 	if staleMapping != nil {
 		staleContext, cancelStale := context.WithTimeout(ctx, cleanupTimeout)
@@ -289,6 +340,10 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 	go s.serveControl(serveErrors)
 	go s.serveDevice(serveErrors)
 
+	var proxyDone <-chan struct{}
+	if s.proxySession != nil {
+		proxyDone = s.proxySession.Done()
+	}
 	select {
 	case <-ctx.Done():
 		return nil
@@ -300,6 +355,19 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 		}
 		s.fail(apperror.CodeInternal, "a daemon listener stopped unexpectedly")
 		return err
+	case <-proxyDone:
+		if s.isStopping() {
+			return nil
+		}
+		s.update(func(snapshot *state.Snapshot) {
+			snapshot.Proxy.Status = state.ProxyFailed
+			snapshot.Proxy.PID = 0
+		})
+		s.fail(apperror.CodeProxyUnavailable, "the local capture proxy stopped unexpectedly")
+		if err := s.proxySession.Err(); err != nil {
+			return err
+		}
+		return errors.New("local capture proxy stopped unexpectedly")
 	}
 }
 
@@ -353,7 +421,18 @@ func (s *Server) serveDevice(errorsChannel chan<- error) {
 func (s *Server) handleDevice(connection net.Conn) {
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(s.config.HandshakeTimeout))
-	frame, err := protocol.ReadFrame(connection)
+	prefix := make([]byte, 4)
+	if _, err := io.ReadFull(connection, prefix); err != nil {
+		s.sendProtocolError(connection, 1, protocolErrorCode(err), "invalid HNB/1 handshake")
+		s.config.Logger.Warn("handshake failed", "device", s.config.DeviceLabel, "error", safeProtocolError(err))
+		return
+	}
+	reader := io.MultiReader(bytes.NewReader(prefix), connection)
+	if looksLikeHTTPRequest(prefix) {
+		s.handleCertificateRequest(connection, reader)
+		return
+	}
+	frame, err := protocol.ReadFrame(reader)
 	if err != nil {
 		s.sendProtocolError(connection, 1, protocolErrorCode(err), "invalid HNB/1 handshake")
 		s.config.Logger.Warn("handshake failed", "device", s.config.DeviceLabel, "error", safeProtocolError(err))
@@ -371,6 +450,126 @@ func (s *Server) handleDevice(connection net.Conn) {
 	default:
 		s.sendProtocolError(connection, 1, "INVALID_HANDSHAKE", "the first HNB/1 frame must be HELLO or DATA_HELLO")
 	}
+}
+
+func looksLikeHTTPRequest(prefix []byte) bool {
+	switch string(prefix) {
+	case "GET ", "HEAD", "POST", "PUT ", "DELE", "PATC", "OPTI", "TRAC", "CONN", "PRI ":
+		return true
+	default:
+		return false
+	}
+}
+
+// handleCertificateRequest shares the existing hdc loopback mapping with HNB/1
+// without exposing another device port. Only the current managed proxy's public
+// CA certificate is served; private keys, capture files, and mitmweb metadata
+// are never addressable through this handler.
+func (s *Server) handleCertificateRequest(connection net.Conn, reader io.Reader) {
+	limited := &io.LimitedReader{R: reader, N: maxHTTPRequestBytes + 1}
+	request, err := http.ReadRequest(bufio.NewReader(limited))
+	if err != nil {
+		writeCertificateHTTPResponse(connection, http.StatusBadRequest, nil, nil)
+		return
+	}
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+	if request.Method != http.MethodGet {
+		writeCertificateHTTPResponse(connection, http.StatusMethodNotAllowed, nil, http.Header{"Allow": []string{http.MethodGet}})
+		return
+	}
+	if request.URL.Path != certificateDownloadPath || request.URL.RawQuery != "" {
+		writeCertificateHTTPResponse(connection, http.StatusNotFound, nil, nil)
+		return
+	}
+
+	certificate, err := s.currentProxyCACertificate()
+	if err != nil {
+		writeCertificateHTTPResponse(connection, http.StatusServiceUnavailable, nil, nil)
+		s.config.Logger.Warn("mitmproxy CA download unavailable", "device", s.config.DeviceLabel)
+		return
+	}
+	writeCertificateHTTPResponse(connection, http.StatusOK, certificate, http.Header{
+		"Content-Disposition": []string{`attachment; filename="mitmproxy-ca-cert.cer"`},
+	})
+	s.config.Logger.Info("served mitmproxy CA certificate", "device", s.config.DeviceLabel, "bytes", len(certificate))
+}
+
+func (s *Server) currentProxyCACertificate() ([]byte, error) {
+	s.mu.Lock()
+	proxySession := s.proxySession
+	s.mu.Unlock()
+	if proxySession == nil {
+		return nil, errors.New("managed proxy is not active")
+	}
+	proxyInfo := proxySession.Info()
+	certificatePath := filepath.Clean(proxyInfo.CACertFile)
+	if !proxyInfo.Enabled || proxyInfo.Status != state.ProxyActive || proxyInfo.CACertFile == "" ||
+		!filepath.IsAbs(certificatePath) {
+		return nil, errors.New("managed proxy CA path is unavailable")
+	}
+	fileInfo, err := os.Lstat(certificatePath)
+	if err != nil {
+		return nil, err
+	}
+	if !fileInfo.Mode().IsRegular() || fileInfo.Size() <= 0 || fileInfo.Size() > maxCertificateBytes {
+		return nil, errors.New("managed proxy CA is not a bounded regular file")
+	}
+	certificate, err := os.ReadFile(certificatePath)
+	if err != nil {
+		return nil, err
+	}
+	if len(certificate) == 0 || len(certificate) > maxCertificateBytes {
+		return nil, errors.New("managed proxy CA size is invalid")
+	}
+	if err := validateCACertificate(certificate); err != nil {
+		return nil, err
+	}
+	return certificate, nil
+}
+
+func validateCACertificate(payload []byte) error {
+	der := payload
+	if block, rest := pem.Decode(payload); block != nil {
+		if block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+			return errors.New("managed proxy CA PEM is invalid")
+		}
+		der = block.Bytes
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		return errors.New("managed proxy CA is not an X.509 certificate")
+	}
+	if !certificate.BasicConstraintsValid || !certificate.IsCA {
+		return errors.New("managed proxy certificate is not a CA")
+	}
+	return nil
+}
+
+func writeCertificateHTTPResponse(connection net.Conn, statusCode int, body []byte, headers http.Header) {
+	if body == nil {
+		body = []byte(http.StatusText(statusCode) + "\n")
+	}
+	responseHeaders := make(http.Header)
+	for name, values := range headers {
+		responseHeaders[name] = append([]string(nil), values...)
+	}
+	responseHeaders.Set("Cache-Control", "no-store")
+	responseHeaders.Set("Content-Type", "text/plain; charset=utf-8")
+	if statusCode == http.StatusOK {
+		responseHeaders.Set("Content-Type", "application/pkix-cert")
+	}
+	response := &http.Response{
+		StatusCode:    statusCode,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        responseHeaders,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Close:         true,
+	}
+	_ = response.Write(connection)
 }
 
 func (s *Server) handleControlConnection(connection net.Conn, frame protocol.Frame) {
@@ -421,6 +620,9 @@ func (s *Server) handleControlConnection(connection net.Conn, frame protocol.Fra
 	capabilities := []string{"control"}
 	if hello.Mode == "vpn" {
 		capabilities = append(capabilities, "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu")
+		if s.proxySession != nil {
+			capabilities = append(capabilities, "proxy")
+		}
 	}
 	payload, err := protocol.MarshalJSONPayload(protocol.HelloAck{
 		SelectedVersion: protocol.CurrentVersion,
@@ -526,7 +728,7 @@ func (s *Server) handleDataConnection(connection net.Conn, frame protocol.Frame)
 	s.dataWriter = writer
 	s.mu.Unlock()
 
-	dataRelay, err := s.config.RelayFactory()
+	dataRelay, err := s.newRelay()
 	if err != nil {
 		s.sendProtocolError(connection, 1, "RELAY_UNAVAILABLE", "the Mac packet relay could not be started")
 		s.releaseData(connection, true)
@@ -668,16 +870,40 @@ func (s *Server) refreshRelayStats() {
 	}
 	stats := relay.Snapshot()
 	s.update(func(snapshot *state.Snapshot) {
-		snapshot.Relay = state.RelayStats{
-			PacketsFromDevice: stats.PacketsFromDevice,
-			BytesFromDevice:   stats.BytesFromDevice,
-			PacketsToDevice:   stats.PacketsToDevice,
-			BytesToDevice:     stats.BytesToDevice,
-			TCPFlows:          stats.TCPFlows,
-			UDPFlows:          stats.UDPFlows,
-			DNSQueries:        stats.DNSQueries,
-		}
+		snapshot.Relay = relayStateStats(stats)
 	})
+}
+
+func (s *Server) newRelay() (PacketRelay, error) {
+	if s.config.RelayFactory != nil {
+		return s.config.RelayFactory()
+	}
+	config := packetrelay.Config{
+		Logger: s.config.Logger,
+		DNS:    packetrelay.NewSystemDNS(s.config.Logger),
+		MTU:    uint32(s.config.MTU),
+	}
+	if s.proxySession != nil {
+		info := s.proxySession.Info()
+		config.DialContext = s.proxySession.DialContext
+		config.ProxyTCPPorts = append([]int(nil), info.InterceptPorts...)
+		config.BlockUDP443 = true
+	}
+	return packetrelay.New(config)
+}
+
+func relayStateStats(stats packetrelay.Stats) state.RelayStats {
+	return state.RelayStats{
+		PacketsFromDevice: stats.PacketsFromDevice,
+		BytesFromDevice:   stats.BytesFromDevice,
+		PacketsToDevice:   stats.PacketsToDevice,
+		BytesToDevice:     stats.BytesToDevice,
+		TCPFlows:          stats.TCPFlows,
+		UDPFlows:          stats.UDPFlows,
+		DNSQueries:        stats.DNSQueries,
+		ProxyTCPFlows:     stats.ProxyTCPFlows,
+		BlockedQUICFlows:  stats.BlockedQUICFlows,
+	}
 }
 
 func (s *Server) applyVPNStatus(connection net.Conn, payload []byte) bool {
@@ -702,7 +928,12 @@ func (s *Server) applyVPNStatus(connection net.Conn, payload []byte) bool {
 	case string(state.VPNReconnecting):
 		vpnStatus, message = state.VPNReconnecting, "HarmonyOS is rebuilding the VPN after a transport interruption"
 	case string(state.VPNActive):
-		vpnStatus, message = state.VPNActive, "IPv4 TCP, UDP, and DNS relay is active"
+		vpnStatus = state.VPNActive
+		if s.proxySession != nil {
+			message = "IPv4 relay and HTTP(S) capture proxy are active"
+		} else {
+			message = "IPv4 TCP, UDP, and DNS relay is active"
+		}
 	case string(state.VPNStopped):
 		vpnStatus, message = state.VPNStopped, "HarmonyOS VPN stopped safely"
 	case string(state.VPNFailed):
@@ -796,15 +1027,7 @@ func (s *Server) releaseData(connection net.Conn, failed bool) {
 	if dataRelay != nil {
 		stats := dataRelay.Snapshot()
 		s.update(func(snapshot *state.Snapshot) {
-			snapshot.Relay = state.RelayStats{
-				PacketsFromDevice: stats.PacketsFromDevice,
-				BytesFromDevice:   stats.BytesFromDevice,
-				PacketsToDevice:   stats.PacketsToDevice,
-				BytesToDevice:     stats.BytesToDevice,
-				TCPFlows:          stats.TCPFlows,
-				UDPFlows:          stats.UDPFlows,
-				DNSQueries:        stats.DNSQueries,
-			}
+			snapshot.Relay = relayStateStats(stats)
 		})
 		_ = dataRelay.Close()
 	}
@@ -852,6 +1075,7 @@ func (s *Server) shutdown() error {
 	controlStopAck := s.controlStopAck
 	dataConnection := s.dataConnection
 	dataRelay := s.dataRelay
+	proxySession := s.proxySession
 	s.controlConnection = nil
 	s.controlWriter = nil
 	s.controlMode = ""
@@ -860,6 +1084,7 @@ func (s *Server) shutdown() error {
 	s.dataConnection = nil
 	s.dataWriter = nil
 	s.dataRelay = nil
+	s.proxySession = nil
 	s.mu.Unlock()
 
 	if s.store != nil {
@@ -906,12 +1131,28 @@ func (s *Server) shutdown() error {
 	}
 
 	var cleanupError error
+	if proxySession != nil {
+		if proxyError := proxySession.Close(); proxyError != nil {
+			cleanupError = errors.Join(cleanupError, proxyError)
+			s.update(func(snapshot *state.Snapshot) {
+				snapshot.Proxy.Status = state.ProxyFailed
+				snapshot.Proxy.PID = 0
+			})
+			s.fail(apperror.CodeProxyUnavailable, "the daemon stopped, but its capture proxy could not be terminated cleanly")
+		} else if s.store != nil && s.store.Get().Daemon != state.DaemonFailed {
+			s.update(func(snapshot *state.Snapshot) {
+				snapshot.Proxy.Status = state.ProxyOff
+				snapshot.Proxy.PID = 0
+			})
+		}
+	}
 	if s.mappingAdded {
 		cleanupContext, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		cleanupError = s.config.Forwarder.Remove(cleanupContext, s.config.DeviceID, s.mapping)
+		mappingError := s.config.Forwarder.Remove(cleanupContext, s.config.DeviceID, s.mapping)
 		cancel()
-		if cleanupError != nil {
-			s.config.Logger.Error("could not remove owned hdc mapping", "device", s.config.DeviceLabel, "error", cleanupError)
+		if mappingError != nil {
+			cleanupError = errors.Join(cleanupError, mappingError)
+			s.config.Logger.Error("could not remove owned hdc mapping", "device", s.config.DeviceLabel, "error", mappingError)
 			s.fail(apperror.CodeRPortFailed, "the daemon stopped, but its owned hdc reverse mapping could not be removed")
 		}
 	}

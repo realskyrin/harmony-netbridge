@@ -2,11 +2,15 @@
 
 HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥。它不依赖 Android API，让鸿蒙设备通过 USB 与 `hdc` 复用 Mac 当前的网络路由，包括企业 Wi-Fi、Cisco AnyConnect 等开发环境。
 
-当前仓库已实现 **Phase 3 单设备稳定版**：在 Phase 2 IPv4 VPN 数据面之上加入可配置 MTU、Control/Data 双通道心跳、断线自动重连、DNS resolver 失效刷新和安全流量统计。HarmonyOS `VpnExtensionAbility` 接管默认 IPv4 路由，Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS。
+当前仓库已实现 **Phase 4 单设备开发版**：HarmonyOS `VpnExtensionAbility` 接管默认 IPv4 路由，Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS；`proxy` 模式还会安全托管一个 loopback-only mitmweb，把常见 HTTP/HTTPS TCP 流量接入抓包链路。
 
 ## 当前能力
 
-- `harmony-netbridge start/status/stop`：管理单设备 daemon、`hdc rport`、实时状态和安全停止。
+- `harmony-netbridge start/proxy/status/stop`：管理单设备 daemon、`hdc rport`、实时状态和安全停止。
+- `proxy` 自动发现并启动 mitmweb，使用独立 `.mitm` capture、项目专属 CA 目录和 loopback Web UI；停止 daemon 时只终止本次受管进程。
+- 抓包模式通过 relay 内部 HTTP `CONNECT` 接入 mitmweb，不修改手机全局 HTTP proxy，也不依赖无法可靠回读的系统代理配置。
+- HTTP 可直接抓取；App 可把 Mac 项目目录中的 `mitmproxy-ca-cert.cer` 经现有 hdc 通道保存到手机，并用系统证书管理器打开。最终安装与信任仍由用户在系统界面确认。
+- 抓包模式拦截 TCP 80/443/8080/8443；UDP/443 被拒绝以促使 QUIC 回退 TCP，其他 UDP、DNS 和非 HTTP TCP 仍按标准模式转发。
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
 - HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
 - `start --mtu 576...1500`：由 Mac 在握手中下发 MTU，设备 VPN 与 gVisor relay 使用同一值，默认 1400。
@@ -17,10 +21,10 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - Mac gVisor relay 支持 TCP、UDP 和 DNS-over-UDP / DNS-over-TCP。
 - DNS 虚拟地址 `198.18.0.1`；Mac 端读取 `scutil --dns`，按最长域名后缀选择企业 split-DNS resolver。resolver 失败时立即刷新配置，UDP 截断响应自动改用 TCP，不静默回退公共 DNS。
 - `status` 展示 MTU、运行时长、双通道 RTT、重连次数以及包/字节/流聚合值；不展示地址、端口、packet payload 或 session token。
-- App 内置 Phase 2 网络自检，通过虚拟 DNS 分别执行 UDP 和 TCP 查询，验证真实的 TUN → USB → Mac → resolver 往返。
+- App 内置 VPN 网络自检、`mitm.it` HTTP 抓包自检，以及不依赖外部证书站点的 Mac CA 下载入口。
 - Gate V 探针仍保留，便于在新设备上单独验证 VPN 授权、`protect()`、TUN read 与销毁。
 
-协议细节见 [HNB/1](docs/protocol.md)，Phase 3 实现与验收见 [Phase 3 文档](docs/phase-3.md)，Phase 2 基线见 [Phase 2 文档](docs/phase-2.md)，原始能力分析见 [技术方案设计文档](docs/spark/2026-08-06-harmony-netbridge-design.md)。
+协议细节见 [HNB/1](docs/protocol.md)，Phase 4 实现与验收见 [Phase 4 文档](docs/phase-4.md)，稳定性基线见 [Phase 3 文档](docs/phase-3.md)，原始能力分析见 [技术方案设计文档](docs/spark/2026-08-06-harmony-netbridge-design.md)。
 
 ## 架构
 
@@ -42,13 +46,16 @@ ArkTS Control TCP ──┤ 127.0.0.1:27183
        Mac daemon 127.0.0.1:<dynamic>
                     │
             gVisor relay.Engine
-              ┌─────┴─────┐
-              │           │
-       TCP/UDP sockets   macOS DNS resolvers
-              │           │
-              └─────┬─────┘
-                    ▼
-       macOS route / AnyConnect / Wi-Fi
+        ┌───────────┼──────────────┐
+        │           │              │
+ direct TCP/UDP   macOS DNS   proxy mode TCP
+        │         resolvers    CONNECT 80/443/
+        │           │          8080/8443
+        │           │              │
+        │           │           mitmweb
+        └───────────┴──────┬───────┘
+                           ▼
+              macOS route / AnyConnect / Wi-Fi
 ```
 
 设备侧和 Mac listener 都只绑定 loopback。项目不创建 macOS utun、不修改 pf、不需要 root，也不自行实现 USB 协议。
@@ -60,6 +67,7 @@ ArkTS Control TCP ──┤ 127.0.0.1:27183
 - DevEco Studio 与 HarmonyOS SDK
 - 已启用 USB 调试并授权的 HarmonyOS NEXT 真机
 - 可用的 `hdc`
+- Phase 4 抓包模式需要 `mitmweb`（mitmproxy 12.x 已验证）；标准 `start` 模式不需要
 
 `hdc` 查找顺序：
 
@@ -122,6 +130,30 @@ HarmonyOS App：
 
    daemon 会先向 App 发送 `STOP_REQUEST`；设备停止 PacketPump、销毁 VPN 后，Mac 只删除本实例创建的精确 hdc 映射。
 
+### 抓包模式
+
+安装 mitmproxy 后，将第 2 步的 `start` 替换为：
+
+```bash
+./bin/harmony-netbridge --mtu 1400 proxy
+```
+
+命令会启动受管 mitmweb，并由 mitmweb 打开带一次性认证信息的 loopback Web UI。若不希望自动打开浏览器：
+
+```bash
+./bin/harmony-netbridge proxy --no-open-browser
+```
+
+随后在 App 点击“启动 VPN”，再点击“验证 HTTP 抓包链路”。HTTP 可立即在 mitmweb 中查看。HTTPS 请点击“下载 Mac CA 证书”，下载完成后点击“用证书管理器打开”，再由 HarmonyOS 系统界面确认安装与信任；不再需要去外部站点下载。App pinning、企业策略或不信任用户 CA 的应用仍可能拒绝解密，这不是隧道故障。
+
+`status` 会显示代理状态、capture 文件、公共 CA 路径、已接入代理的 TCP flow 数和 QUIC 回退计数，但不会显示 mitmweb token、请求头或 flow 内容。默认文件位于：
+
+- capture：`~/Library/Caches/HarmonyNetBridge/captures/*.mitm`
+- CA 配置：`~/Library/Caches/HarmonyNetBridge/mitmproxy/`
+- mitmweb 日志：`~/Library/Logs/HarmonyNetBridge/mitmweb.log`
+
+capture、日志与 CA 文件使用 `0600`，所属目录使用 `0700`。停止命令不会删除 capture，便于之后用 `mitmdump --no-server --rfile <capture>` 离线分析。
+
 本阶段只运行一个设备会话。若 hdc 同时列出多个设备，必须显式选择本次唯一目标：
 
 ```bash
@@ -144,10 +176,12 @@ HarmonyOS App：
 - HNB/1 parser、Control/Data 会话关联、daemon 生命周期和 hdc 映射清理。
 - MTU 参数边界、双通道心跳、心跳 RTT 状态与单设备重连计数。
 - gVisor 内存网络中的真实 TCP、UDP、UDP DNS 与 TCP DNS 往返。
+- HTTP CONNECT 适配、非 2xx/超长响应拒绝、buffered tunnel 数据保留、代理 flow 统计与 UDP/443 回退。
+- mitmweb 受管生命周期、私有 capture/CA 权限、只读 CA 下载端点和精确 orphan 识别。
 - macOS resolver 失效刷新与 UDP DNS 截断后的 TCP 重试。
-- ArkTS 协议、MTU、重连退避与 DNS TCP 分片测试，Native CMake/Ninja 构建和 HAP 打包。
+- ArkTS 协议、MTU、重连退避、DNS TCP 分片、CA 下载响应边界与 `mitm.it` 响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
 
-这些检查不能替代真机证据。2026-08-06 已在单台物理设备完成 MTU 1280、TUN 双向流量、TCP/UDP/DNS 自检、双通道心跳、两轮 daemon 强制退出后的自动恢复，以及最终 VPN/进程/hdc 映射可靠清理；详细结果见 [Phase 3 文档](docs/phase-3.md)。跨小时、休眠唤醒和吞吐基准仍未执行。
+这些检查不能替代真机证据。2026-08-06 已在单台物理设备完成 Phase 3 的 MTU、双向流量、心跳和故障恢复验收；Phase 4 的当前真机与 mitmweb 证据见 [Phase 4 文档](docs/phase-4.md)。跨小时、休眠唤醒和吞吐基准仍未执行。
 
 ## 当前限制
 
@@ -158,19 +192,22 @@ HarmonyOS App：
 - hdc 调试授权是前提，本项目定位为开发工具，不是消费者 USB 网络共享产品。
 - 同一时间只能存在一个活动 VPN；其他 VPN 或企业设备策略可能阻止启动。
 - DNS 转发依赖 Mac 提供可用的 IPv4 resolver；不会为了“看起来可用”而绕过企业 DNS 使用公共服务器。
-- Phase 4 的 mitmproxy / Charles 一键模式和证书引导尚未实现。
+- 代理模式只接管常见 HTTP(S) TCP 端口；它不是任意 TCP 协议解码器。WebSocket/HTTP2 由 mitmproxy 能力决定，HTTP/3 不直接抓取，而是通过拒绝 UDP/443 促使客户端回退。
+- 当前自动托管的是 mitmweb；Charles 可手动作为未来 adapter 接入，但尚无受管生命周期实现。
+- HarmonyNetBridge 不绕过证书校验。HTTPS 需要用户手动信任 CA；证书 pinning、企业安全策略或明确禁用用户 CA 的应用无法解密。
 
 ## 日志与隐私
 
 - 日志：`~/Library/Logs/HarmonyNetBridge/harmony-netbridge.log`
+- mitmweb 日志：`~/Library/Logs/HarmonyNetBridge/mitmweb.log`（可能含 mitmweb 自己生成的本机 UI 认证 URL，权限固定为 `0600`）
 - 运行目录：当前用户缓存目录下的 `HarmonyNetBridge/runtime`
 - 日志最多保留当前文件与一个 5 MiB 轮转文件。
 
 项目不记录 packet payload、完整 session token、完整设备唯一标识、签名凭据或代理凭据。
 
-## 下一阶段
+## 后续计划
 
-Phase 4 将实现 mitmproxy / Charles 一键抓包体验；多设备并发不在当前计划内。Phase 3 后续只继续补充跨小时稳定性、Mac 休眠唤醒与吞吐基准。
+Phase 1—4 的单设备 MVP 已形成完整链路。后续优先补充跨小时稳定性、Mac 休眠唤醒、吞吐基准与 CA 安装的不同 HarmonyOS 版本兼容性；多设备并发不在当前计划内。
 
 ## License
 

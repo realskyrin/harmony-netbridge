@@ -14,6 +14,7 @@ func TestStoreAndAtomicFile(t *testing.T) {
 		snapshot.Daemon = DaemonRunning
 		snapshot.Transport = TransportPortReady
 		snapshot.HostPort = 54321
+		snapshot.Proxy = ProxySnapshot{Enabled: true, Status: ProxyActive, ListenPort: 8080}
 	})
 	if updated.UpdatedAt != start.Add(time.Second) {
 		t.Fatalf("UpdatedAt = %s", updated.UpdatedAt)
@@ -26,7 +27,8 @@ func TestStoreAndAtomicFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Daemon != DaemonRunning || loaded.Transport != TransportPortReady || loaded.HostPort != 54321 {
+	if loaded.SchemaVersion != 3 || loaded.Daemon != DaemonRunning || loaded.Transport != TransportPortReady ||
+		loaded.HostPort != 54321 || loaded.Proxy.Status != ProxyActive || loaded.Proxy.ListenPort != 8080 {
 		t.Fatalf("loaded state = %#v", loaded)
 	}
 }

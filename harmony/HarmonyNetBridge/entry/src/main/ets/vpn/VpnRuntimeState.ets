@@ -7,16 +7,19 @@ const BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
 export class VpnRuntimeSnapshot {
   readonly state: string;
   readonly detail: string;
+  readonly proxyEnabled: boolean;
 
-  constructor(state: string, detail: string) {
+  constructor(state: string, detail: string, proxyEnabled: boolean) {
     this.state = state;
     this.detail = detail;
+    this.proxyEnabled = proxyEnabled;
   }
 }
 
 interface VpnRuntimeEventPayload {
   state: string;
   detail: string;
+  proxyEnabled: boolean;
 }
 
 // HarmonyOS may host the VPN Extension separately from the UI Ability. Keep a
@@ -24,15 +27,16 @@ interface VpnRuntimeEventPayload {
 // common event restricted to this bundle. The Mac CLI remains authoritative
 // for cross-device status.
 export class VpnRuntimeState {
-  private static current: VpnRuntimeSnapshot = new VpnRuntimeSnapshot('STOPPED', 'VPN 尚未启动');
+  private static current: VpnRuntimeSnapshot = new VpnRuntimeSnapshot('STOPPED', 'VPN 尚未启动', false);
 
   static get snapshot(): VpnRuntimeSnapshot {
     return VpnRuntimeState.current;
   }
 
-  static publish(state: string, detail: string): void {
-    VpnRuntimeState.current = new VpnRuntimeSnapshot(state, detail);
-    const payload: VpnRuntimeEventPayload = { state: state, detail: detail };
+  static publish(state: string, detail: string,
+    proxyEnabled: boolean = VpnRuntimeState.current.proxyEnabled): void {
+    VpnRuntimeState.current = new VpnRuntimeSnapshot(state, detail, proxyEnabled);
+    const payload: VpnRuntimeEventPayload = { state: state, detail: detail, proxyEnabled: proxyEnabled };
     commonEventManager.publish(VPN_STATUS_EVENT, {
       bundleName: BUNDLE_NAME,
       data: JSON.stringify(payload)
@@ -48,10 +52,11 @@ export class VpnRuntimeState {
     }
     try {
       const payload: VpnRuntimeEventPayload = JSON.parse(data) as VpnRuntimeEventPayload;
-      if (payload.state.length === 0 || payload.state.length > 32 || payload.detail.length > 512) {
+      if (payload.state.length === 0 || payload.state.length > 32 || payload.detail.length > 512 ||
+        typeof payload.proxyEnabled !== 'boolean') {
         return false;
       }
-      VpnRuntimeState.current = new VpnRuntimeSnapshot(payload.state, payload.detail);
+      VpnRuntimeState.current = new VpnRuntimeSnapshot(payload.state, payload.detail, payload.proxyEnabled);
       return true;
     } catch (error) {
       return false;

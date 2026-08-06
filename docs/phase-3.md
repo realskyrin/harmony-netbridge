@@ -79,4 +79,4 @@ RECONNECTING
 - 仍只支持 IPv4 TCP/UDP/DNS；不转发 IPv6、ICMP 或任意原始协议。
 - 自动重连不能让已物理拔出的 USB、关机设备或被系统策略撤销的 VPN 权限凭空恢复；外部条件恢复后会继续尝试。
 - 跨小时、Mac 休眠唤醒和高吞吐基准仍需单独执行。
-- Phase 4 将实现 mitmproxy / Charles 一键抓包模式；多设备并发不在当前计划内。
+- Phase 4 的受管 mitmweb 抓包模式已经实现，见 [`phase-4.md`](phase-4.md)；多设备并发不在当前计划内。

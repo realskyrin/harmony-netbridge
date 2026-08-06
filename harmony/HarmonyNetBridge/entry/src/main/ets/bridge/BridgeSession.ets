@@ -111,7 +111,7 @@ export class BridgeSession {
       const hello: HelloPayload = {
         role: 'control',
         mode: 'phase1',
-        appVersion: '0.3.0',
+        appVersion: '0.4.0',
         supportedVersions: [1],
         capabilities: ['control'],
         message: 'hello'

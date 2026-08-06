@@ -1,6 +1,6 @@
 # HNB/1 Protocol
 
-HNB/1 是 HarmonyNetBridge 在 hdc TCP 通道上使用的有界二进制帧协议。Phase 3 使用一条低频 Control 连接和一条高频 Data 连接；二者由随机 session token 关联，分别维护独立 sequence 和心跳状态。
+HNB/1 是 HarmonyNetBridge 在 hdc TCP 通道上使用的有界二进制帧协议。Phase 3/4 使用一条低频 Control 连接和一条高频 Data 连接；二者由随机 session token 关联，分别维护独立 sequence 和心跳状态。Phase 4 只增加能力协商，不改变帧头或协议版本。
 
 ## 固定头部
 
@@ -47,7 +47,7 @@ App 在建立 TCP 连接后 5 秒内发送 sequence 1：
 {
   "role": "control",
   "mode": "phase1",
-  "appVersion": "0.3.0",
+  "appVersion": "0.4.0",
   "supportedVersions": [1],
   "capabilities": ["control"],
   "message": "hello"
@@ -56,7 +56,7 @@ App 在建立 TCP 连接后 5 秒内发送 sequence 1：
 
 Mac 返回 sequence 1 的 `HELLO_ACK`，完成 `hello/world`。
 
-### Phase 3 VPN
+### Phase 3/4 VPN
 
 VpnExtensionAbility 使用新的 Control socket，不复用 UI 的 Phase 1 socket：
 
@@ -64,9 +64,9 @@ VpnExtensionAbility 使用新的 Control socket，不复用 UI 的 Phase 1 socke
 {
   "role": "control",
   "mode": "vpn",
-  "appVersion": "0.3.0",
+  "appVersion": "0.4.0",
   "supportedVersions": [1],
-  "capabilities": ["control", "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu"],
+  "capabilities": ["control", "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu", "proxy"],
   "message": "hello"
 }
 ```
@@ -77,13 +77,15 @@ Mac 返回：
 {
   "selectedVersion": 1,
   "sessionToken": "32-lowercase-hex-characters",
-  "capabilities": ["control", "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu"],
+  "capabilities": ["control", "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu", "proxy"],
   "mtu": 1400,
   "message": "world"
 }
 ```
 
 session token 来自 16 个密码学安全随机字节，仅在当前 Control 会话有效，不落日志或状态文件。`mtu` 必须是 `576...1500` 的整数；Harmony VPN 与当前会话的 Mac relay 必须使用相同值。
+
+`proxy` 是可选 capability：App 声明它表示能够展示抓包状态，Mac 只在受管 mitmweb 已成功监听时返回它。App 不因缺少 `proxy` 拒绝标准 VPN；返回 `proxy` 时 App 将抓包模式写入进程内状态并展示手动 CA 引导。IP packet 仍使用相同 Data stream，代理选择只发生在 Mac relay 内部。
 
 ## Data handshake 与 packet stream
 

@@ -2,7 +2,7 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "HarmonyNetBridge Phase 3 resilient USB IPv4 VPN bridge"
+      "value": "HarmonyNetBridge Phase 4 USB IPv4 VPN and capture bridge"
     },
     {
       "name": "entry_ability_desc",
@@ -14,7 +14,7 @@
     },
     {
       "name": "vpn_extension_desc",
-      "value": "USB IPv4 VPN tunnel with TCP, UDP, and macOS DNS relay"
+      "value": "USB IPv4 VPN with TCP, UDP, macOS DNS relay, and optional HTTP capture"
     }
   ]
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/realskyrin/harmony-netbridge/internal/daemon"
 	"github.com/realskyrin/harmony-netbridge/internal/hdc"
 	"github.com/realskyrin/harmony-netbridge/internal/logging"
+	proxybridge "github.com/realskyrin/harmony-netbridge/internal/proxy"
 	"github.com/realskyrin/harmony-netbridge/internal/runtimepath"
 	"github.com/realskyrin/harmony-netbridge/internal/state"
 	"github.com/realskyrin/harmony-netbridge/internal/version"
@@ -31,15 +32,23 @@ const (
 )
 
 type invocation struct {
-	command     string
-	hdcPath     string
-	deviceID    string
-	deviceLabel string
-	devicePort  int
-	mtu         int
-	mtuSet      bool
-	help        bool
-	version     bool
+	command       string
+	hdcPath       string
+	deviceID      string
+	deviceLabel   string
+	devicePort    int
+	mtu           int
+	mtuSet        bool
+	proxyMode     bool
+	proxyPort     int
+	proxyPortSet  bool
+	webPort       int
+	webPortSet    bool
+	mitmwebPath   string
+	captureFile   string
+	noOpenBrowser bool
+	help          bool
+	version       bool
 }
 
 func main() {
@@ -69,6 +78,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	switch parsed.command {
 	case "start":
 		err = startCommand(parsed, paths, stdout)
+	case "proxy":
+		err = startCommand(parsed, paths, stdout)
 	case "status":
 		err = statusCommand(paths, stdout)
 	case "stop":
@@ -85,11 +96,32 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 }
 
 func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) error {
+	wantsProxy := parsed.command == "proxy" || parsed.proxyMode
 	if response, err := callDaemon(paths, control.CommandStatus, 300*time.Millisecond); err == nil && response.OK {
 		if response.State.Daemon == state.DaemonRunning {
+			if response.State.Proxy.Enabled != wantsProxy {
+				return apperror.New(apperror.CodeDaemonRunning,
+					"HarmonyNetBridge is already running in a different mode; stop it before switching modes")
+			}
 			if parsed.mtuSet && response.State.MTU != 0 && response.State.MTU != parsed.mtu {
 				return apperror.New(apperror.CodeDaemonRunning,
 					fmt.Sprintf("HarmonyNetBridge is already running with MTU %d; stop it before changing MTU", response.State.MTU))
+			}
+			if wantsProxy {
+				proxyChanged := (parsed.proxyPortSet && response.State.Proxy.ListenPort != parsed.proxyPort) ||
+					(parsed.webPortSet && response.State.Proxy.WebPort != parsed.webPort) ||
+					(parsed.noOpenBrowser && response.State.Proxy.OpenBrowser)
+				if parsed.mitmwebPath != "" {
+					resolved, discoverError := proxybridge.Discover(parsed.mitmwebPath)
+					if discoverError != nil {
+						return apperror.Wrap(apperror.CodeProxyUnavailable, discoverError.Error(), discoverError)
+					}
+					proxyChanged = proxyChanged || resolved != response.State.Proxy.Executable
+				}
+				if proxyChanged {
+					return apperror.New(apperror.CodeDaemonRunning,
+						"HarmonyNetBridge is already running with different proxy options; stop it before changing them")
+				}
 			}
 			fmt.Fprintln(output, "HarmonyNetBridge is already running.")
 			printStatus(output, response.State)
@@ -126,6 +158,24 @@ func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) 
 	if err := paths.Ensure(); err != nil {
 		return err
 	}
+	if wantsProxy {
+		parsed.mitmwebPath, err = proxybridge.Discover(parsed.mitmwebPath)
+		if err != nil {
+			return apperror.Wrap(apperror.CodeProxyUnavailable, err.Error(), err)
+		}
+		previous, _ := state.ReadFile(paths.StateFile)
+		mayRecoverOwnedProxy := previous.Proxy.Enabled && previous.Proxy.ListenPort == parsed.proxyPort &&
+			previous.Proxy.WebPort == parsed.webPort
+		if !mayRecoverOwnedProxy {
+			if err := proxybridge.CheckLoopbackPorts(parsed.proxyPort, parsed.webPort); err != nil {
+				return apperror.Wrap(apperror.CodePortConflict, err.Error(), err)
+			}
+		}
+		parsed.captureFile, err = proxybridge.NewCapturePath(paths.CaptureDir, time.Now())
+		if err != nil {
+			return apperror.Wrap(apperror.CodeProxyUnavailable, "a private capture filename could not be created", err)
+		}
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve harmony-netbridge executable: %w", err)
@@ -145,6 +195,18 @@ func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) 
 		"--device-label", target.RedactedName(),
 		"--device-port", strconv.Itoa(parsed.devicePort),
 		"--mtu", strconv.Itoa(parsed.mtu),
+	}
+	if wantsProxy {
+		childArguments = append(childArguments,
+			"--proxy-mode",
+			"--proxy-port", strconv.Itoa(parsed.proxyPort),
+			"--web-port", strconv.Itoa(parsed.webPort),
+			"--mitmweb", parsed.mitmwebPath,
+			"--capture-file", parsed.captureFile,
+		)
+		if parsed.noOpenBrowser {
+			childArguments = append(childArguments, "--no-open-browser")
+		}
 	}
 	command := exec.Command(executable, childArguments...)
 	command.Stdin = nil
@@ -259,6 +321,9 @@ func daemonCommand(parsed invocation, paths runtimepath.Paths) error {
 	if parsed.hdcPath == "" || parsed.deviceID == "" || parsed.deviceLabel == "" {
 		return errors.New("internal daemon arguments are incomplete")
 	}
+	if parsed.proxyMode && (parsed.mitmwebPath == "" || parsed.captureFile == "") {
+		return errors.New("internal proxy daemon arguments are incomplete")
+	}
 	if err := paths.Ensure(); err != nil {
 		return err
 	}
@@ -270,14 +335,31 @@ func daemonCommand(parsed invocation, paths runtimepath.Paths) error {
 	logger.Info("daemon starting", "version", version.Version, "device", parsed.deviceLabel)
 
 	manager := hdc.NewManager(parsed.hdcPath)
+	var proxyFactory daemon.ProxyFactory
+	if parsed.proxyMode {
+		proxyConfig := proxybridge.Config{
+			Executable:  parsed.mitmwebPath,
+			ListenPort:  parsed.proxyPort,
+			WebPort:     parsed.webPort,
+			OpenBrowser: !parsed.noOpenBrowser,
+			CaptureFile: parsed.captureFile,
+			ConfDir:     paths.ProxyConfDir,
+			LogFile:     paths.ProxyLogFile,
+		}
+		proxyFactory = func(_ state.ProxySnapshot) (daemon.ProxySession, error) {
+			return proxybridge.Start(proxyConfig)
+		}
+	}
 	server, err := daemon.New(daemon.Config{
-		Paths:       paths,
-		DeviceID:    parsed.deviceID,
-		DeviceLabel: parsed.deviceLabel,
-		DevicePort:  parsed.devicePort,
-		MTU:         parsed.mtu,
-		Forwarder:   manager,
-		Logger:      logger,
+		Paths:         paths,
+		DeviceID:      parsed.deviceID,
+		DeviceLabel:   parsed.deviceLabel,
+		DevicePort:    parsed.devicePort,
+		MTU:           parsed.mtu,
+		Forwarder:     manager,
+		Logger:        logger,
+		ProxyFactory:  proxyFactory,
+		ProxyRecovery: proxybridge.RecoverManaged,
 	})
 	if err != nil {
 		logger.Error("daemon configuration failed", "error", err)
@@ -316,6 +398,22 @@ func printStatus(output io.Writer, snapshot state.Snapshot) {
 	if snapshot.MTU > 0 {
 		fmt.Fprintf(output, "MTU:       %d\n", snapshot.MTU)
 	}
+	if snapshot.Proxy.Enabled {
+		fmt.Fprintf(output, "Proxy:     %s (HTTP/HTTPS TCP)\n", snapshot.Proxy.Status)
+		if snapshot.Proxy.WebPort > 0 {
+			if snapshot.Proxy.OpenBrowser {
+				fmt.Fprintf(output, "Proxy UI:  opened by mitmweb on 127.0.0.1:%d\n", snapshot.Proxy.WebPort)
+			} else {
+				fmt.Fprintf(output, "Proxy UI:  loopback 127.0.0.1:%d (browser launch disabled)\n", snapshot.Proxy.WebPort)
+			}
+		}
+		if snapshot.Proxy.CaptureFile != "" {
+			fmt.Fprintf(output, "Capture:   %s\n", snapshot.Proxy.CaptureFile)
+		}
+		if snapshot.Proxy.CACertFile != "" {
+			fmt.Fprintf(output, "HTTPS CA:  App downloads from %s (system confirmation required)\n", snapshot.Proxy.CACertFile)
+		}
+	}
 	if snapshot.Daemon == state.DaemonRunning && !snapshot.StartedAt.IsZero() {
 		fmt.Fprintf(output, "Uptime:    %s\n", formatDuration(time.Since(snapshot.StartedAt)))
 	}
@@ -332,6 +430,10 @@ func printStatus(output io.Writer, snapshot state.Snapshot) {
 			formatBytes(snapshot.Relay.BytesToDevice), snapshot.Relay.PacketsToDevice)
 		fmt.Fprintf(output, "Flows:     TCP %d / UDP %d / DNS %d\n",
 			snapshot.Relay.TCPFlows, snapshot.Relay.UDPFlows, snapshot.Relay.DNSQueries)
+		if snapshot.Proxy.Enabled {
+			fmt.Fprintf(output, "Intercept: proxied TCP %d / QUIC fallbacks %d\n",
+				snapshot.Relay.ProxyTCPFlows, snapshot.Relay.BlockedQUICFlows)
+		}
 	}
 	if snapshot.Reconnects > 0 {
 		fmt.Fprintf(output, "Reconnects: %d\n", snapshot.Reconnects)
@@ -369,7 +471,7 @@ func printError(output io.Writer, err error) int {
 		apperror.CodeMultipleDevices, apperror.CodeDeviceNotFound:
 		return 3
 	case apperror.CodeDaemonRunning, apperror.CodeDaemonUnavailable,
-		apperror.CodePortConflict, apperror.CodeRPortFailed:
+		apperror.CodePortConflict, apperror.CodeRPortFailed, apperror.CodeProxyUnavailable:
 		return 4
 	case apperror.CodeHandshakeTimeout, apperror.CodeVersionUnsupported,
 		apperror.CodeAppDisconnected:
@@ -380,11 +482,16 @@ func printError(output io.Writer, err error) int {
 }
 
 func parseInvocation(arguments []string) (invocation, error) {
-	parsed := invocation{devicePort: daemon.DefaultDevicePort, mtu: daemon.DefaultMTU}
+	parsed := invocation{
+		devicePort: daemon.DefaultDevicePort,
+		mtu:        daemon.DefaultMTU,
+		proxyPort:  proxybridge.DefaultListenPort,
+		webPort:    proxybridge.DefaultWebPort,
+	}
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
 		switch argument {
-		case "start", "status", "stop", "__daemon":
+		case "start", "proxy", "status", "stop", "__daemon":
 			if parsed.command != "" {
 				return invocation{}, fmt.Errorf("multiple commands were provided: %s and %s", parsed.command, argument)
 			}
@@ -393,7 +500,12 @@ func parseInvocation(arguments []string) (invocation, error) {
 			parsed.help = true
 		case "--version":
 			parsed.version = true
-		case "--hdc", "--device", "--device-label", "--device-port", "--mtu":
+		case "--proxy-mode":
+			parsed.proxyMode = true
+		case "--no-open-browser":
+			parsed.noOpenBrowser = true
+		case "--hdc", "--device", "--device-label", "--device-port", "--mtu",
+			"--proxy-port", "--web-port", "--mitmweb", "--capture-file":
 			if index+1 >= len(arguments) {
 				return invocation{}, fmt.Errorf("%s requires a value", argument)
 			}
@@ -403,7 +515,9 @@ func parseInvocation(arguments []string) (invocation, error) {
 			}
 		default:
 			name, value, found := strings.Cut(argument, "=")
-			if found && (name == "--hdc" || name == "--device" || name == "--device-label" || name == "--device-port" || name == "--mtu") {
+			if found && (name == "--hdc" || name == "--device" || name == "--device-label" ||
+				name == "--device-port" || name == "--mtu" || name == "--proxy-port" ||
+				name == "--web-port" || name == "--mitmweb" || name == "--capture-file") {
 				if err := assignOption(&parsed, name, value); err != nil {
 					return invocation{}, err
 				}
@@ -418,8 +532,21 @@ func parseInvocation(arguments []string) (invocation, error) {
 	if parsed.command != "__daemon" && parsed.deviceLabel != "" {
 		return invocation{}, errors.New("--device-label is an internal option")
 	}
-	if parsed.mtuSet && parsed.command != "start" && parsed.command != "__daemon" {
-		return invocation{}, errors.New("--mtu is only valid with start")
+	if parsed.command != "__daemon" && (parsed.proxyMode || parsed.captureFile != "") {
+		return invocation{}, errors.New("--proxy-mode and --capture-file are internal options")
+	}
+	if parsed.command == "proxy" {
+		parsed.proxyMode = true
+	}
+	if parsed.mtuSet && parsed.command != "start" && parsed.command != "proxy" && parsed.command != "__daemon" {
+		return invocation{}, errors.New("--mtu is only valid with start or proxy")
+	}
+	proxyOptionSet := parsed.proxyPortSet || parsed.webPortSet || parsed.mitmwebPath != "" || parsed.noOpenBrowser
+	if proxyOptionSet && parsed.command != "proxy" && !(parsed.command == "__daemon" && parsed.proxyMode) {
+		return invocation{}, errors.New("proxy options are only valid with proxy")
+	}
+	if parsed.proxyPort == parsed.webPort && (parsed.command == "proxy" || parsed.proxyMode) {
+		return invocation{}, errors.New("--proxy-port and --web-port must differ")
 	}
 	return parsed, nil
 }
@@ -448,20 +575,40 @@ func assignOption(parsed *invocation, name, value string) error {
 		}
 		parsed.mtu = mtu
 		parsed.mtuSet = true
+	case "--proxy-port":
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65_535 {
+			return errors.New("--proxy-port must be an integer in 1...65535")
+		}
+		parsed.proxyPort = port
+		parsed.proxyPortSet = true
+	case "--web-port":
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65_535 {
+			return errors.New("--web-port must be an integer in 1...65535")
+		}
+		parsed.webPort = port
+		parsed.webPortSet = true
+	case "--mitmweb":
+		parsed.mitmwebPath = value
+	case "--capture-file":
+		parsed.captureFile = value
 	}
 	return nil
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, `HarmonyNetBridge Phase 3
+	fmt.Fprintln(output, `HarmonyNetBridge Phase 4
 
 Usage:
   harmony-netbridge [--hdc <path>] [--device <target>] [--mtu <bytes>] start
+  harmony-netbridge [--hdc <path>] [--device <target>] [--mtu <bytes>] proxy
   harmony-netbridge status
   harmony-netbridge stop
 
 Commands:
   start    Start the per-user bridge daemon and USB packet relay
+  proxy    Start the VPN relay plus a managed mitmweb capture session
   status   Read live daemon, transport, and VPN state
   stop     Stop the daemon and remove only its owned hdc mapping
 
@@ -469,6 +616,10 @@ Options:
   --hdc <path>       Explicit hdc executable (also HARMONY_NETBRIDGE_HDC)
   --device <target>  Select one target when multiple devices are Connected
   --mtu <bytes>      VPN MTU in 576...1500 (default 1400)
+  --mitmweb <path>   Explicit mitmweb executable (also HARMONY_NETBRIDGE_MITMWEB)
+  --proxy-port <n>   Loopback proxy port (default 8080)
+  --web-port <n>     Loopback mitmweb UI port (default 8081)
+  --no-open-browser  Do not let mitmweb open its authenticated Web UI
   --version          Print the CLI version
   -h, --help         Show this help`)
 }

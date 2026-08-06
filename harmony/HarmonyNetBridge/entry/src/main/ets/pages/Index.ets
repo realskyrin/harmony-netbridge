@@ -1,3 +1,4 @@
+import { common } from '@kit.AbilityKit';
 import { BusinessError, commonEventManager } from '@kit.BasicServicesKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import {
@@ -6,6 +7,8 @@ import {
   bridgeSession
 } from '../bridge/BridgeSession';
 import { VpnDiagnosticResult, VpnNetworkDiagnostics } from '../vpn/VpnNetworkDiagnostics';
+import { ProxyCertificate } from '../vpn/ProxyCertificate';
+import { ProxyDiagnostics } from '../vpn/ProxyDiagnostics';
 import { VPN_STATUS_EVENT, VpnRuntimeSnapshot, VpnRuntimeState } from '../vpn/VpnRuntimeState';
 
 const BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
@@ -21,8 +24,15 @@ struct Index {
   @State gateDetail: string = '仅路由 198.18.0.1/32，完成后立即销毁 VPN';
   @State vpnState: string = VpnRuntimeState.snapshot.state;
   @State vpnDetail: string = VpnRuntimeState.snapshot.detail;
+  @State proxyEnabled: boolean = VpnRuntimeState.snapshot.proxyEnabled;
   @State diagnosticState: string = 'NOT_RUN';
   @State diagnosticDetail: string = '启动 VPN 后可验证真实的 UDP DNS 与 TCP DNS 往返';
+  @State proxyDiagnosticState: string = 'NOT_RUN';
+  @State proxyDiagnosticDetail: string = '在 Mac 运行 proxy 后，可验证 HTTP 流量是否进入 mitmweb';
+  @State certificateState: string = 'NOT_DOWNLOADED';
+  @State certificateDetail: string = '从 Mac 本地 CA 经 USB 下载，无需访问外部证书站点';
+  @State certificateDownloaded: boolean = false;
+  private proxyCertificate: ProxyCertificate = new ProxyCertificate();
   private vpnStatusTimer: number = -1;
   private vpnStatusSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
 
@@ -34,6 +44,7 @@ struct Index {
     });
     this.subscribeVpnStatus();
     this.refreshVpnStatus();
+    this.refreshCertificateStatus();
     this.vpnStatusTimer = setInterval(() => {
       this.refreshVpnStatus();
     }, 500);
@@ -79,7 +90,7 @@ struct Index {
 
   private displayedStatusTitle(): string {
     if (this.vpnState === 'ACTIVE') {
-      return 'Mac USB 通道已接管';
+      return this.proxyEnabled ? 'Mac USB 抓包通道已接管' : 'Mac USB 通道已接管';
     }
     if (this.vpnState === 'RECONNECTING') {
       return '正在重建 Mac USB 通道';
@@ -92,6 +103,9 @@ struct Index {
 
   private displayedStatusDetail(): string {
     if (this.vpnOwnsUsbBridge()) {
+      if (this.proxyEnabled) {
+        return 'HTTP(S) TCP 由 Mac mitmweb 接管；HTTPS 解密需要手动信任 CA';
+      }
       return 'Control / Data 双通道由 VPN Extension 管理，无需另建 Phase 1 会话';
     }
     return this.statusDetail;
@@ -125,7 +139,7 @@ struct Index {
   }
 
   private async requestVpnStart(): Promise<void> {
-    VpnRuntimeState.publish('STARTING', '正在关闭 Phase 1 会话并启动 VPN');
+    VpnRuntimeState.publish('STARTING', '正在关闭 Phase 1 会话并启动 VPN', false);
     this.refreshVpnStatus();
     try {
       await bridgeSession.disconnect();
@@ -136,7 +150,7 @@ struct Index {
       });
     } catch (error) {
       const businessError: BusinessError = error as BusinessError;
-      VpnRuntimeState.publish('FAILED', `启动 VPN 失败：${businessError.code}`);
+      VpnRuntimeState.publish('FAILED', `启动 VPN 失败：${businessError.code}`, false);
       this.refreshVpnStatus();
     }
   }
@@ -151,6 +165,12 @@ struct Index {
     const snapshot: VpnRuntimeSnapshot = VpnRuntimeState.snapshot;
     this.vpnState = snapshot.state;
     this.vpnDetail = snapshot.detail;
+    this.proxyEnabled = snapshot.proxyEnabled;
+    if (this.proxyDiagnosticState === 'NOT_RUN') {
+      this.proxyDiagnosticDetail = snapshot.proxyEnabled ?
+        'mitmweb 已就绪；点击下方按钮验证 HTTP 抓包链路' :
+        '在 Mac 运行 proxy 后，可验证 HTTP 流量是否进入 mitmweb';
+    }
   }
 
   private subscribeVpnStatus(): void {
@@ -190,6 +210,70 @@ struct Index {
     }
   }
 
+  private async requestProxyDiagnostics(): Promise<void> {
+    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || this.proxyDiagnosticState === 'RUNNING') {
+      return;
+    }
+    this.proxyDiagnosticState = 'RUNNING';
+    this.proxyDiagnosticDetail = '正在请求 http://mitm.it，验证 TUN → USB → mitmweb';
+    try {
+      this.proxyDiagnosticDetail = await new ProxyDiagnostics().run();
+      this.proxyDiagnosticState = 'PASS';
+    } catch (error) {
+      const diagnosticError: Error = error as Error;
+      this.proxyDiagnosticState = 'FAIL';
+      this.proxyDiagnosticDetail = diagnosticError.message;
+    }
+  }
+
+  private uiAbilityContext(): common.UIAbilityContext {
+    return this.getUIContext().getHostContext() as common.UIAbilityContext;
+  }
+
+  private refreshCertificateStatus(): void {
+    this.certificateDownloaded = this.proxyCertificate.hasDownloaded(this.uiAbilityContext());
+    if (this.certificateDownloaded) {
+      this.certificateState = 'READY';
+      this.certificateDetail = 'mitmproxy-ca-cert.cer 已保存到本机，可交给系统证书管理器';
+    }
+  }
+
+  private async requestCertificateDownload(): Promise<void> {
+    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || this.certificateState === 'DOWNLOADING') {
+      return;
+    }
+    this.certificateState = 'DOWNLOADING';
+    this.certificateDetail = '正在通过 hdc USB 通道读取 Mac 本地 CA';
+    try {
+      const bytes: number = await this.proxyCertificate.download(this.uiAbilityContext());
+      this.certificateDownloaded = true;
+      this.certificateState = 'READY';
+      this.certificateDetail = `已保存 mitmproxy-ca-cert.cer（${bytes} 字节）`;
+    } catch (error) {
+      const certificateError: Error = error as Error;
+      this.certificateDownloaded = this.proxyCertificate.hasDownloaded(this.uiAbilityContext());
+      this.certificateState = 'FAIL';
+      this.certificateDetail = `证书下载失败：${certificateError.message}`;
+    }
+  }
+
+  private async requestOpenCertificateManager(): Promise<void> {
+    if (!this.certificateDownloaded || this.certificateState === 'OPENING') {
+      return;
+    }
+    this.certificateState = 'OPENING';
+    this.certificateDetail = '正在打开系统证书管理器';
+    try {
+      await this.proxyCertificate.openWithCertificateManager(this.uiAbilityContext());
+      this.certificateState = 'READY';
+      this.certificateDetail = '证书管理器已打开；是否安装与信任以系统确认结果为准';
+    } catch (error) {
+      const certificateError: Error = error as Error;
+      this.certificateState = 'FAIL';
+      this.certificateDetail = `无法打开证书管理器：${certificateError.message}`;
+    }
+  }
+
   build() {
     Scroll() {
       Column({ space: 20 }) {
@@ -198,7 +282,7 @@ struct Index {
             .fontSize(30)
             .fontWeight(FontWeight.Bold)
             .fontColor('#F8FAFC')
-          Text('Phase 3 · 稳定 USB IPv4 VPN')
+          Text('Phase 4 · USB IPv4 VPN 与抓包')
             .fontSize(14)
             .fontColor('#94A3B8')
         }
@@ -260,6 +344,72 @@ struct Index {
         .borderRadius(18)
 
         Column({ space: 12 }) {
+          Text('Phase 4 抓包')
+            .fontSize(18)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#F8FAFC')
+            .width('100%')
+          Text(this.proxyEnabled ? this.proxyDiagnosticState : 'OFF')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.proxyDiagnosticState === 'PASS' ? '#22C55E' :
+              (this.proxyDiagnosticState === 'FAIL' ? '#F87171' : '#38BDF8'))
+            .width('100%')
+          Text(this.proxyEnabled ? this.proxyDiagnosticDetail :
+            'Mac 当前为标准转发模式；运行 harmony-netbridge proxy 后重新启动 VPN')
+            .fontSize(14)
+            .fontColor('#CBD5E1')
+            .lineHeight(21)
+            .width('100%')
+          if (this.proxyEnabled) {
+            Text('HTTPS 解密仍需你在系统界面确认信任；应用只下载 Mac 的公共 CA，不会静默安装。')
+              .fontSize(12)
+              .fontColor('#FBBF24')
+              .lineHeight(19)
+              .width('100%')
+          }
+          Button('验证 HTTP 抓包链路')
+            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.proxyDiagnosticState !== 'RUNNING')
+            .backgroundColor('#B45309')
+            .fontColor('#FFFFFF')
+            .width('100%')
+            .onClick(() => {
+              this.requestProxyDiagnostics();
+            })
+          Text(`CA · ${this.certificateState}`)
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.certificateState === 'READY' ? '#22C55E' :
+              (this.certificateState === 'FAIL' ? '#F87171' : '#38BDF8'))
+            .width('100%')
+          Text(this.certificateDetail)
+            .fontSize(13)
+            .fontColor('#CBD5E1')
+            .lineHeight(20)
+            .width('100%')
+          Button('下载 Mac CA 证书')
+            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.certificateState !== 'DOWNLOADING')
+            .backgroundColor('#0F766E')
+            .fontColor('#FFFFFF')
+            .width('100%')
+            .onClick(() => {
+              this.requestCertificateDownload();
+            })
+          Button('用证书管理器打开')
+            .enabled(this.certificateDownloaded && this.certificateState !== 'OPENING')
+            .backgroundColor('#334155')
+            .fontColor('#FFFFFF')
+            .width('100%')
+            .onClick(() => {
+              this.requestOpenCertificateManager();
+            })
+        }
+        .width('100%')
+        .padding(20)
+        .backgroundColor('#111C2E')
+        .borderRadius(18)
+
+        Column({ space: 12 }) {
           Text('完整 VPN Tunnel')
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
@@ -307,7 +457,7 @@ struct Index {
         .borderRadius(18)
 
         Column({ space: 12 }) {
-          Text('Phase 3 网络自检')
+          Text('VPN 网络自检')
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
             .fontColor('#F8FAFC')
@@ -378,6 +528,7 @@ struct Index {
           this.InfoRow('握手协议', 'HNB/1 hello → world')
           this.InfoRow('VPN', this.vpnState === 'ACTIVE' ? 'IPv4 默认路由已接管' : '当前未接管默认路由')
           this.InfoRow('Relay', 'gVisor TCP / UDP + Mac DNS')
+          this.InfoRow('抓包', this.proxyEnabled ? 'mitmweb HTTP(S) TCP' : '未启用')
           this.InfoRow('稳定性', 'Control / Data 心跳 + 退避重连')
         }
         .width('100%')
@@ -385,7 +536,7 @@ struct Index {
         .backgroundColor('#111C2E')
         .borderRadius(18)
 
-        Text('在 Mac 先运行 harmony-netbridge start，可用 --mtu 设置 MTU。通道中断会自动重连；主动停止不会重连。')
+        Text('标准转发运行 harmony-netbridge start；抓包运行 harmony-netbridge proxy。HTTPS CA 必须由用户手动信任。')
           .fontSize(14)
           .fontColor('#94A3B8')
           .lineHeight(21)

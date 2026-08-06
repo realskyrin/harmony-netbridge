@@ -9,6 +9,7 @@ cd "${project_root}"
 go test -race ./...
 go vet ./...
 GOOS=darwin GOARCH=arm64 go build -trimpath -o "${check_dir}/harmony-netbridge" ./cmd/harmony-netbridge
+"${check_dir}/harmony-netbridge" --help | grep -q 'harmony-netbridge .* proxy'
 "${project_root}/scripts/test-harmony.sh"
 "${project_root}/scripts/build-harmony.sh"
 
@@ -35,4 +36,4 @@ case "${module_profile}" in
     ;;
 esac
 
-echo "HarmonyNetBridge Phase 3 static and host checks passed."
+echo "HarmonyNetBridge Phase 4 static and host checks passed."

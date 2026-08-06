@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,9 +43,12 @@ func TestEngineRelaysTCP(t *testing.T) {
 		serverDone <- copyError
 	}()
 
-	engine, err := New(Config{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, listener.Addr().String())
-	}})
+	engine, err := New(Config{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, listener.Addr().String())
+		},
+		ProxyTCPPorts: []int{443},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +71,37 @@ func TestEngineRelaysTCP(t *testing.T) {
 		t.Fatalf("TCP response = %q", response)
 	}
 	stats := engine.Snapshot()
-	if stats.TCPFlows != 1 || stats.PacketsFromDevice == 0 || stats.PacketsToDevice == 0 {
+	if stats.TCPFlows != 1 || stats.ProxyTCPFlows != 1 || stats.PacketsFromDevice == 0 || stats.PacketsToDevice == 0 {
 		t.Fatalf("TCP stats = %#v", stats)
+	}
+}
+
+func TestEngineBlocksUDP443InProxyMode(t *testing.T) {
+	t.Parallel()
+	var hostDials atomic.Uint64
+	engine, err := New(Config{
+		BlockUDP443: true,
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			hostDials.Add(1)
+			return nil, errors.New("must not dial UDP 443")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := newTestPeer(t, engine)
+	connection, err := peer.dialUDP([4]byte{203, 0, 113, 30}, 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_, _ = connection.Write([]byte("quic probe"))
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && engine.Snapshot().BlockedQUICFlows == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stats := engine.Snapshot(); stats.BlockedQUICFlows != 1 || hostDials.Load() != 0 {
+		t.Fatalf("proxy UDP stats = %#v, host dials = %d", stats, hostDials.Load())
 	}
 }
 

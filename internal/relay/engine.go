@@ -63,6 +63,8 @@ type Config struct {
 	MaxTCPInFlight int
 	DialTimeout    time.Duration
 	UDPIdleTimeout time.Duration
+	ProxyTCPPorts  []int
+	BlockUDP443    bool
 }
 
 // Stats is a point-in-time, payload-free relay snapshot.
@@ -74,6 +76,8 @@ type Stats struct {
 	TCPFlows          uint64
 	UDPFlows          uint64
 	DNSQueries        uint64
+	ProxyTCPFlows     uint64
+	BlockedQUICFlows  uint64
 }
 
 // Engine owns one IPv4 Netstack instance and all host-side flow adapters for a
@@ -89,6 +93,8 @@ type Engine struct {
 
 	dialTimeout    time.Duration
 	udpIdleTimeout time.Duration
+	proxyTCPPorts  map[uint16]struct{}
+	blockUDP443    bool
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -102,6 +108,8 @@ type Engine struct {
 	tcpFlows          atomic.Uint64
 	udpFlows          atomic.Uint64
 	dnsQueries        atomic.Uint64
+	proxyTCPFlows     atomic.Uint64
+	blockedQUICFlows  atomic.Uint64
 }
 
 // New creates a running relay engine. The returned Output channel contains
@@ -138,6 +146,13 @@ func New(config Config) (*Engine, error) {
 	if config.UDPIdleTimeout <= 0 {
 		config.UDPIdleTimeout = defaultUDPIdleTimeout
 	}
+	proxyTCPPorts := make(map[uint16]struct{}, len(config.ProxyTCPPorts))
+	for _, port := range config.ProxyTCPPorts {
+		if port < 1 || port > 65_535 {
+			return nil, fmt.Errorf("proxy TCP port %d is outside 1...65535", port)
+		}
+		proxyTCPPorts[uint16(port)] = struct{}{}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	linkEndpoint := channel.New(config.PacketQueue, config.MTU, "")
@@ -172,6 +187,8 @@ func New(config Config) (*Engine, error) {
 		virtualDNS:     tcpip.AddrFrom4(config.VirtualDNS.As4()),
 		dialTimeout:    config.DialTimeout,
 		udpIdleTimeout: config.UDPIdleTimeout,
+		proxyTCPPorts:  proxyTCPPorts,
+		blockUDP443:    config.BlockUDP443,
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -219,6 +236,8 @@ func (e *Engine) Snapshot() Stats {
 		TCPFlows:          e.tcpFlows.Load(),
 		UDPFlows:          e.udpFlows.Load(),
 		DNSQueries:        e.dnsQueries.Load(),
+		ProxyTCPFlows:     e.proxyTCPFlows.Load(),
+		BlockedQUICFlows:  e.blockedQUICFlows.Load(),
 	}
 }
 
@@ -287,6 +306,9 @@ func (e *Engine) handleTCP(request *tcp.ForwarderRequest) {
 	request.Complete(false)
 	deviceConnection := gonet.NewTCPConn(&queue, endpoint)
 	e.tcpFlows.Add(1)
+	if _, proxied := e.proxyTCPPorts[id.LocalPort]; proxied {
+		e.proxyTCPFlows.Add(1)
+	}
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -329,6 +351,10 @@ func (e *Engine) handleUDP(request *udp.ForwarderRequest) bool {
 			e.serveDNSUDP(deviceConnection)
 		}()
 		return true
+	}
+	if e.blockUDP443 && id.LocalPort == 443 {
+		e.blockedQUICFlows.Add(1)
+		return false
 	}
 
 	dialContext, cancel := context.WithTimeout(e.ctx, e.dialTimeout)

@@ -26,7 +26,7 @@ const DATA_HANDSHAKE_TIMEOUT_MS: number = 5000;
 const PROBE_TIMEOUT_MS: number = 3000;
 type UIStopResolve = (reason: string) => void;
 
-// The extension is the sole owner of every Phase 3 socket, the VPN connection,
+// The extension is the sole owner of every Phase 4 socket, the VPN connection,
 // and the native packet pump. EntryAbility only requests start/stop.
 export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbility {
   private mode: string = 'vpn';
@@ -37,6 +37,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
   private probeSocket: socket.UDPSocket | undefined = undefined;
 
   private controlSession: VpnControlSession | undefined = undefined;
+  private proxyEnabled: boolean = false;
   private pumpStarted: boolean = false;
   private destroyRequested: boolean = false;
   private cleanupPromise: Promise<void> | undefined = undefined;
@@ -79,7 +80,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
   private async runPhase3(): Promise<void> {
     let reconnectAttempt: number = 0;
     let terminalReason: string = 'system_stop';
-    VpnRuntimeState.publish('STARTING', '正在建立 HNB Control/Data 通道');
+    this.proxyEnabled = false;
+    VpnRuntimeState.publish('STARTING', '正在建立 HNB Control/Data 通道', false);
     try {
       while (!this.destroyRequested) {
         try {
@@ -108,7 +110,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
           }
           await this.cleanupPhase3(false);
           const delay: number = reconnectDelay(reconnectAttempt);
-          VpnRuntimeState.publish('RECONNECTING', `连接中断，${delay / 1000} 秒后进行第 ${reconnectAttempt} 次重连`);
+        VpnRuntimeState.publish('RECONNECTING',
+          `连接中断，${delay / 1000} 秒后进行第 ${reconnectAttempt} 次重连`, this.proxyEnabled);
           hilog.warn(DOMAIN, TAG,
             'PHASE3_RECONNECT attempt=%{public}d delay_ms=%{public}d code=%{public}d message=%{public}s',
             reconnectAttempt, delay, code, businessError.message);
@@ -120,7 +123,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
             terminalReason = waitResult;
             break;
           }
-          VpnRuntimeState.publish('STARTING', `正在进行第 ${reconnectAttempt} 次自动重连`);
+          VpnRuntimeState.publish('STARTING', `正在进行第 ${reconnectAttempt} 次自动重连`, this.proxyEnabled);
         }
       }
     } finally {
@@ -129,7 +132,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       await this.cleanupPhase3(reportStopped);
       this.unsubscribeFromUIStop();
       if (reportStopped) {
-        VpnRuntimeState.publish('STOPPED', 'VPN 已安全销毁');
+        VpnRuntimeState.publish('STOPPED', 'VPN 已安全销毁', this.proxyEnabled);
       }
       await this.stopOwnExtension();
     }
@@ -141,6 +144,9 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     const controlSession: VpnControlSession = new VpnControlSession();
     this.controlSession = controlSession;
     const handshake: VpnControlHandshake = await controlSession.connect();
+    this.proxyEnabled = handshake.proxyEnabled;
+    VpnRuntimeState.publish('STARTING', handshake.proxyEnabled ?
+      'Mac 抓包代理已就绪，正在创建 VPN' : 'Mac 标准转发已就绪，正在创建 VPN', handshake.proxyEnabled);
     hilog.info(DOMAIN, TAG, 'PHASE3_CONTROL_CONNECTED mtu=%{public}d', handshake.mtu);
     await controlSession.reportStatus('STARTING', 'control_connected');
 
@@ -206,9 +212,15 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       throw new Error(`Native packet pump failed to start: ${startResult}`);
     }
     this.pumpStarted = true;
-    VpnRuntimeState.publish('ACTIVE', `IPv4 TCP / UDP / DNS 已通过 USB 转发到 Mac · MTU ${handshake.mtu}`);
+    const activeDetail: string = handshake.proxyEnabled ?
+      `HTTP(S) TCP 已接入 Mac 抓包代理；UDP / DNS 直连 · MTU ${handshake.mtu}` :
+      `IPv4 TCP / UDP / DNS 已通过 USB 转发到 Mac · MTU ${handshake.mtu}`;
+    VpnRuntimeState.publish('ACTIVE', activeDetail, handshake.proxyEnabled);
     await controlSession.reportStatus('ACTIVE', 'packet_pump_started');
     hilog.info(DOMAIN, TAG, 'PHASE3_ACTIVE');
+    if (handshake.proxyEnabled) {
+      hilog.info(DOMAIN, TAG, 'PHASE4_PROXY_ACTIVE');
+    }
 
     return await Promise.race([
       controlSession.waitForStop(),

@@ -47,6 +47,20 @@ func TestParseInvocationAcceptsConfiguredMTU(t *testing.T) {
 	}
 }
 
+func TestParseInvocationAcceptsProxyMode(t *testing.T) {
+	parsed, err := parseInvocation([]string{
+		"proxy", "--mtu", "1280", "--proxy-port", "9080", "--web-port=9081",
+		"--mitmweb", "/opt/homebrew/bin/mitmweb", "--no-open-browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.proxyMode || parsed.proxyPort != 9080 || parsed.webPort != 9081 ||
+		parsed.mitmwebPath != "/opt/homebrew/bin/mitmweb" || !parsed.noOpenBrowser {
+		t.Fatalf("proxy invocation = %#v", parsed)
+	}
+}
+
 func TestRecentDaemonFailureRejectsStaleStateAndReturnsCurrentError(t *testing.T) {
 	t.Parallel()
 	root, err := os.MkdirTemp("/tmp", "hnb-main-")
@@ -90,11 +104,39 @@ func TestParseInvocationRejectsUnknownAndMultipleCommands(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"devices"}, {"start", "stop"}, {"start", "--device-port", "0"},
 		{"start", "--mtu", "575"}, {"start", "--mtu", "1501"},
-		{"status", "--mtu", "1280"},
+		{"status", "--mtu", "1280"}, {"start", "--proxy-port", "8080"},
+		{"proxy", "--proxy-port", "8081", "--web-port", "8081"},
+		{"proxy", "--capture-file", "/tmp/not-public"},
 	} {
 		if _, err := parseInvocation(arguments); err == nil {
 			t.Fatalf("parseInvocation(%v) error = nil", arguments)
 		}
+	}
+}
+
+func TestPrintStatusShowsSafeProxyMetadata(t *testing.T) {
+	var output bytes.Buffer
+	printStatus(&output, state.Snapshot{
+		Daemon:    state.DaemonRunning,
+		Transport: state.TransportDataConnected,
+		VPN:       state.VPNActive,
+		Proxy: state.ProxySnapshot{
+			Enabled:     true,
+			Status:      state.ProxyActive,
+			WebPort:     8081,
+			CaptureFile: "/private/capture.mitm",
+			CACertFile:  "/private/mitmproxy-ca-cert.cer",
+			PID:         1234,
+			Executable:  "/private/mitmweb",
+		},
+		Relay: state.RelayStats{PacketsFromDevice: 1, ProxyTCPFlows: 2, BlockedQUICFlows: 3},
+	})
+	text := output.String()
+	if !strings.Contains(text, "Proxy:     ACTIVE") || !strings.Contains(text, "Intercept: proxied TCP 2 / QUIC fallbacks 3") {
+		t.Fatalf("proxy status = %s", text)
+	}
+	if strings.Contains(text, "1234") || strings.Contains(text, "/private/mitmweb") {
+		t.Fatalf("proxy process metadata leaked: %s", text)
 	}
 }
 

@@ -22,12 +22,14 @@ func TestFromRootsAndEnsure(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(paths.RuntimeDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
-		t.Fatalf("runtime permissions = %o", info.Mode().Perm())
+	for _, directory := range []string{paths.RuntimeDir, paths.CaptureDir, paths.ProxyConfDir, paths.LogDir} {
+		info, err := os.Stat(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
+			t.Fatalf("permissions for %s = %o", directory, info.Mode().Perm())
+		}
 	}
 }
 

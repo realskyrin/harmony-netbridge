@@ -14,8 +14,11 @@ type Paths struct {
 	RuntimeDir    string
 	ControlSocket string
 	StateFile     string
+	CaptureDir    string
+	ProxyConfDir  string
 	LogDir        string
 	LogFile       string
+	ProxyLogFile  string
 }
 
 // Default resolves macOS user-specific locations without trusting the process working directory.
@@ -36,12 +39,16 @@ func Default() (Paths, error) {
 
 // FromRoots constructs paths for production or isolated tests.
 func FromRoots(runtimeDir, logDir string) (Paths, error) {
+	cacheRoot := filepath.Dir(filepath.Clean(runtimeDir))
 	paths := Paths{
 		RuntimeDir:    filepath.Clean(runtimeDir),
 		ControlSocket: filepath.Join(runtimeDir, "control.sock"),
 		StateFile:     filepath.Join(runtimeDir, "state.json"),
+		CaptureDir:    filepath.Join(cacheRoot, "captures"),
+		ProxyConfDir:  filepath.Join(cacheRoot, "mitmproxy"),
 		LogDir:        filepath.Clean(logDir),
 		LogFile:       filepath.Join(logDir, "harmony-netbridge.log"),
+		ProxyLogFile:  filepath.Join(logDir, "mitmweb.log"),
 	}
 	if len(paths.ControlSocket) > maxUnixSocketPath {
 		return Paths{}, fmt.Errorf("control socket path is too long for macOS: %s", paths.ControlSocket)
@@ -56,6 +63,14 @@ func (p Paths) Ensure() error {
 	}
 	if err := os.Chmod(p.RuntimeDir, 0o700); err != nil {
 		return fmt.Errorf("protect runtime directory: %w", err)
+	}
+	for _, directory := range []string{p.CaptureDir, p.ProxyConfDir} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			return fmt.Errorf("create private cache directory: %w", err)
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			return fmt.Errorf("protect private cache directory: %w", err)
+		}
 	}
 	if err := os.MkdirAll(p.LogDir, 0o700); err != nil {
 		return fmt.Errorf("create log directory: %w", err)

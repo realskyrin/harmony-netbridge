@@ -25,11 +25,13 @@ export class VpnControlHandshake {
   readonly socketFd: number;
   readonly sessionToken: string;
   readonly mtu: number;
+  readonly proxyEnabled: boolean;
 
-  constructor(socketFd: number, sessionToken: string, mtu: number) {
+  constructor(socketFd: number, sessionToken: string, mtu: number, proxyEnabled: boolean) {
     this.socketFd = socketFd;
     this.sessionToken = sessionToken;
     this.mtu = mtu;
+    this.proxyEnabled = proxyEnabled;
   }
 }
 
@@ -95,9 +97,9 @@ export class VpnControlSession {
       const hello: HelloPayload = {
         role: 'control',
         mode: 'vpn',
-        appVersion: '0.3.0',
+        appVersion: '0.4.0',
         supportedVersions: [1],
-        capabilities: ['control', 'data', 'tcp', 'udp', 'dns', 'heartbeat', 'reconnect', 'mtu'],
+        capabilities: ['control', 'data', 'tcp', 'udp', 'dns', 'heartbeat', 'reconnect', 'mtu', 'proxy'],
         message: 'hello'
       };
       this.handshakeTimer = setTimeout(() => {
@@ -186,7 +188,8 @@ export class VpnControlSession {
       this.handshakeReject = undefined;
       if (resolve !== undefined) {
         const socketFd: number = await client.getSocketFd();
-        resolve(new VpnControlHandshake(socketFd, acknowledgement.sessionToken, acknowledgement.mtu));
+        const proxyEnabled: boolean = acknowledgement.capabilities.indexOf('proxy') >= 0;
+        resolve(new VpnControlHandshake(socketFd, acknowledgement.sessionToken, acknowledgement.mtu, proxyEnabled));
       }
       return;
     }

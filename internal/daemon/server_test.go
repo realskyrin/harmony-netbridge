@@ -1,11 +1,21 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +44,49 @@ type fakePacketRelay struct {
 	output    chan []byte
 	closeOnce sync.Once
 	stats     packetrelay.Stats
+}
+
+type fakeProxySession struct {
+	info       state.ProxySnapshot
+	done       chan struct{}
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	closeCalls int
+	waitErr    error
+}
+
+func newFakeProxySession() *fakeProxySession {
+	return &fakeProxySession{
+		info: state.ProxySnapshot{
+			Enabled:        true,
+			Status:         state.ProxyActive,
+			PID:            4321,
+			ListenPort:     8080,
+			WebPort:        8081,
+			InterceptPorts: []int{80, 443, 8080, 8443},
+		},
+		done:    make(chan struct{}),
+		waitErr: errors.New("fixture proxy exit"),
+	}
+}
+
+func (p *fakeProxySession) Info() state.ProxySnapshot { return p.info }
+
+func (p *fakeProxySession) DialContext(_ context.Context, _, _ string) (net.Conn, error) {
+	return nil, errors.New("fixture proxy dial is unused")
+}
+
+func (p *fakeProxySession) Done() <-chan struct{} { return p.done }
+func (p *fakeProxySession) Err() error            { return p.waitErr }
+
+func (p *fakeProxySession) crash() { p.closeOnce.Do(func() { close(p.done) }) }
+
+func (p *fakeProxySession) Close() error {
+	p.mu.Lock()
+	p.closeCalls++
+	p.mu.Unlock()
+	p.crash()
+	return nil
 }
 
 func newFakePacketRelay() *fakePacketRelay {
@@ -73,6 +126,293 @@ func TestNewRejectsUnsafeVPNMTU(t *testing.T) {
 		if _, err := New(Config{DeviceID: "device", DeviceLabel: "redacted", MTU: mtu, Forwarder: forwarder}); err == nil {
 			t.Fatalf("New accepted MTU %d", mtu)
 		}
+	}
+}
+
+func TestServerServesOnlyManagedProxyCACertificate(t *testing.T) {
+	t.Parallel()
+	certificate := testCACertificate(t)
+	certificatePath := filepath.Join(t.TempDir(), "mitmproxy-ca-cert.cer")
+	if err := os.WriteFile(certificatePath, certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxySession := newFakeProxySession()
+	proxySession.info.CACertFile = certificatePath
+	server := &Server{
+		config: Config{
+			DeviceLabel:      "device-redacted",
+			HandshakeTimeout: time.Second,
+			Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		},
+		proxySession: proxySession,
+	}
+
+	response, body := exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /mitmproxy-ca-cert.cer HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("certificate status = %d, body = %q", response.StatusCode, body)
+	}
+	if !bytes.Equal(body, certificate) {
+		t.Fatal("certificate response did not preserve the managed CA bytes")
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "application/pkix-cert" {
+		t.Fatalf("Content-Type = %q", contentType)
+	}
+	if cacheControl := response.Header.Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q", cacheControl)
+	}
+	if disposition := response.Header.Get("Content-Disposition"); disposition != `attachment; filename="mitmproxy-ca-cert.cer"` {
+		t.Fatalf("Content-Disposition = %q", disposition)
+	}
+
+	response, _ = exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /capture.mitm HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unaddressable proxy file status = %d", response.StatusCode)
+	}
+	response, _ = exchangeDeviceHTTP(t, server, http.MethodHead,
+		"HEAD /mitmproxy-ca-cert.cer HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+	if response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Allow") != http.MethodGet {
+		t.Fatalf("HEAD response = %d Allow=%q", response.StatusCode, response.Header.Get("Allow"))
+	}
+}
+
+func TestServerRefusesCertificateWithoutActiveManagedProxy(t *testing.T) {
+	t.Parallel()
+	server := &Server{config: Config{
+		DeviceLabel:      "device-redacted",
+		HandshakeTimeout: time.Second,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}}
+	response, _ := exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /mitmproxy-ca-cert.cer HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("standard daemon certificate status = %d", response.StatusCode)
+	}
+}
+
+func exchangeDeviceHTTP(t *testing.T, server *Server, method, request string) (*http.Response, []byte) {
+	t.Helper()
+	serverConnection, clientConnection := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleDevice(serverConnection)
+		close(done)
+	}()
+	_ = clientConnection.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(clientConnection, request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientConnection), &http.Request{Method: method})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	_ = clientConnection.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("device HTTP handler did not return")
+	}
+	return response, body
+}
+
+func testCACertificate(t *testing.T) []byte {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "HarmonyNetBridge test CA"},
+		NotBefore:             time.Unix(0, 0),
+		NotAfter:              time.Unix(4_102_444_800, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func TestServerAdvertisesAndClosesManagedProxy(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "hnb-proxy-lifecycle-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths, err := runtimepath.FromRoots(filepath.Join(root, "runtime"), filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 1)}
+	proxySession := newFakeProxySession()
+	server, err := New(Config{
+		Paths: paths, DeviceID: "secret-device-id", DeviceLabel: "device-redacted", Forwarder: forwarder,
+		ProxyFactory: func(_ state.ProxySnapshot) (ProxySession, error) { return proxySession, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(runContext) }()
+	var mapping hdc.Mapping
+	select {
+	case mapping = <-forwarder.added:
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy daemon did not start")
+	}
+	connection, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello, _ := protocol.MarshalJSONPayload(protocol.Hello{
+		Role: "control", Mode: "vpn", AppVersion: "test", SupportedVersions: []int{1},
+		Capabilities: []string{"control", "data", "proxy"}, Message: "hello",
+	})
+	if err := protocol.WriteFrame(connection, protocol.Frame{Type: protocol.TypeHello, Sequence: 1, Payload: hello}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := protocol.ReadFrame(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acknowledgement protocol.HelloAck
+	if err := protocol.UnmarshalJSONPayload(frame.Payload, &acknowledgement); err != nil ||
+		!hasCapability(acknowledgement.Capabilities, "proxy") {
+		t.Fatalf("proxy HELLO_ACK = %#v", acknowledgement)
+	}
+	if snapshot := server.store.Get(); snapshot.Proxy.Status != state.ProxyActive || snapshot.Proxy.PID != 4321 {
+		t.Fatalf("proxy state = %#v", snapshot.Proxy)
+	}
+	_ = connection.Close()
+	cancel()
+	select {
+	case runError := <-runResult:
+		if runError != nil {
+			t.Fatal(runError)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy daemon did not stop")
+	}
+	proxySession.mu.Lock()
+	closeCalls := proxySession.closeCalls
+	proxySession.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("proxy Close calls = %d", closeCalls)
+	}
+	if _, err := os.Stat(paths.StateFile); !os.IsNotExist(err) {
+		t.Fatalf("normal proxy shutdown retained state: %v", err)
+	}
+}
+
+func TestServerRetainsFailureWhenManagedProxyExits(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "hnb-proxy-failure-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths, err := runtimepath.FromRoots(filepath.Join(root, "runtime"), filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 1)}
+	proxySession := newFakeProxySession()
+	server, err := New(Config{
+		Paths: paths, DeviceID: "secret-device-id", DeviceLabel: "device-redacted", Forwarder: forwarder,
+		ProxyFactory: func(_ state.ProxySnapshot) (ProxySession, error) { return proxySession, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(context.Background()) }()
+	select {
+	case <-forwarder.added:
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy daemon did not start")
+	}
+	proxySession.crash()
+	select {
+	case runError := <-runResult:
+		if runError == nil {
+			t.Fatal("Run error = nil after proxy crash")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy crash did not stop daemon")
+	}
+	snapshot, err := state.ReadFile(paths.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Daemon != state.DaemonFailed || snapshot.Proxy.Status != state.ProxyFailed ||
+		snapshot.Proxy.PID != 0 || snapshot.LastErrorCode != string(apperror.CodeProxyUnavailable) {
+		t.Fatalf("proxy failure state = %#v", snapshot)
+	}
+}
+
+func TestStandardServerRecoversPreviousProxyOrphan(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "hnb-proxy-mode-switch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths, err := runtimepath.FromRoots(filepath.Join(root, "runtime"), filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	previous := state.NewStarting(time.Now(), "device-redacted", DefaultDevicePort)
+	previous.Daemon = state.DaemonRunning
+	previous.Proxy = state.ProxySnapshot{Enabled: true, Status: state.ProxyActive, PID: 2468}
+	if err := state.WriteFile(paths.StateFile, previous); err != nil {
+		t.Fatal(err)
+	}
+	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 1)}
+	var recovered state.ProxySnapshot
+	server, err := New(Config{
+		Paths: paths, DeviceID: "secret-device-id", DeviceLabel: "device-redacted", Forwarder: forwarder,
+		ProxyRecovery: func(snapshot state.ProxySnapshot) error {
+			recovered = snapshot
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(runContext) }()
+	select {
+	case <-forwarder.added:
+	case <-time.After(3 * time.Second):
+		t.Fatal("standard daemon did not start")
+	}
+	if !recovered.Enabled || recovered.PID != 2468 || server.store.Get().Proxy.Status != state.ProxyOff {
+		t.Fatalf("recovered proxy = %#v; current = %#v", recovered, server.store.Get().Proxy)
+	}
+	cancel()
+	select {
+	case runError := <-runResult:
+		if runError != nil {
+			t.Fatal(runError)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("standard daemon did not stop")
 	}
 }
 

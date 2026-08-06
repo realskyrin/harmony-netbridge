@@ -24,6 +24,7 @@ const (
 	CodeVPNAlreadyActive   Code = "VPN_ALREADY_ACTIVE"
 	CodeVPNCreateFailed    Code = "VPN_CREATE_FAILED"
 	CodeVPNProtectFailed   Code = "VPN_PROTECT_FAILED"
+	CodeProxyUnavailable   Code = "PROXY_UNAVAILABLE"
 	CodeDaemonRunning      Code = "DAEMON_ALREADY_RUNNING"
 	CodeDaemonUnavailable  Code = "DAEMON_UNAVAILABLE"
 	CodeInternal           Code = "INTERNAL_ERROR"

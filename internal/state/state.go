@@ -13,6 +13,7 @@ import (
 type DaemonStatus string
 type TransportStatus string
 type VPNStatus string
+type ProxyStatus string
 
 const (
 	DaemonStopped  DaemonStatus = "STOPPED"
@@ -34,6 +35,11 @@ const (
 	VPNActive       VPNStatus = "ACTIVE"
 	VPNStopped      VPNStatus = "STOPPED"
 	VPNFailed       VPNStatus = "FAILED"
+
+	ProxyOff      ProxyStatus = "OFF"
+	ProxyStarting ProxyStatus = "STARTING"
+	ProxyActive   ProxyStatus = "ACTIVE"
+	ProxyFailed   ProxyStatus = "FAILED"
 )
 
 // RelayStats contains aggregate, payload-free data-plane counters. It never
@@ -46,6 +52,25 @@ type RelayStats struct {
 	TCPFlows          uint64 `json:"tcpFlows"`
 	UDPFlows          uint64 `json:"udpFlows"`
 	DNSQueries        uint64 `json:"dnsQueries"`
+	ProxyTCPFlows     uint64 `json:"proxyTcpFlows"`
+	BlockedQUICFlows  uint64 `json:"blockedQuicFlows"`
+}
+
+// ProxySnapshot contains only the process metadata needed for status and safe
+// crash recovery. It deliberately excludes mitmweb tokens, credentials, flow
+// contents, request headers, and private-key paths.
+type ProxySnapshot struct {
+	Enabled        bool        `json:"enabled"`
+	Status         ProxyStatus `json:"status"`
+	PID            int         `json:"pid,omitempty"`
+	Executable     string      `json:"executable,omitempty"`
+	ListenPort     int         `json:"listenPort,omitempty"`
+	WebPort        int         `json:"webPort,omitempty"`
+	OpenBrowser    bool        `json:"openBrowser,omitempty"`
+	CaptureFile    string      `json:"captureFile,omitempty"`
+	CACertFile     string      `json:"caCertFile,omitempty"`
+	ConfDir        string      `json:"confDir,omitempty"`
+	InterceptPorts []int       `json:"interceptPorts,omitempty"`
 }
 
 // Snapshot is returned by status and persisted for diagnostics. Device is always redacted.
@@ -64,6 +89,7 @@ type Snapshot struct {
 	DataHeartbeatAt    time.Time       `json:"dataHeartbeatAt,omitempty"`
 	DataRTTMillis      int64           `json:"dataRttMillis,omitempty"`
 	Relay              RelayStats      `json:"relay"`
+	Proxy              ProxySnapshot   `json:"proxy"`
 	Message            string          `json:"message,omitempty"`
 	LastErrorCode      string          `json:"lastErrorCode,omitempty"`
 	LastError          string          `json:"lastError,omitempty"`
@@ -74,10 +100,11 @@ type Snapshot struct {
 // NewStarting creates the first daemon state.
 func NewStarting(now time.Time, device string, devicePort int) Snapshot {
 	return Snapshot{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Daemon:        DaemonStarting,
 		Transport:     TransportNoDevice,
 		VPN:           VPNStopped,
+		Proxy:         ProxySnapshot{Status: ProxyOff},
 		Device:        device,
 		DevicePort:    devicePort,
 		Message:       "Starting HarmonyNetBridge",
@@ -89,10 +116,11 @@ func NewStarting(now time.Time, device string, devicePort int) Snapshot {
 // Stopped creates a status response when no daemon is reachable.
 func Stopped(now time.Time) Snapshot {
 	return Snapshot{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Daemon:        DaemonStopped,
 		Transport:     TransportNoDevice,
 		VPN:           VPNStopped,
+		Proxy:         ProxySnapshot{Status: ProxyOff},
 		Message:       "HarmonyNetBridge is stopped",
 		UpdatedAt:     now.UTC(),
 	}
