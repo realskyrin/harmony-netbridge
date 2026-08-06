@@ -2,6 +2,8 @@ export const HNB_HEADER_SIZE: number = 16;
 export const HNB_VERSION: number = 1;
 export const HNB_MAX_CONTROL_PAYLOAD: number = 16 * 1024;
 export const HNB_MAX_PACKET_PAYLOAD: number = 65535;
+export const HNB_MIN_MTU: number = 576;
+export const HNB_MAX_MTU: number = 1500;
 
 export enum HnbFrameType {
   HELLO = 0x01,
@@ -11,6 +13,7 @@ export enum HnbFrameType {
   STOP_ACK = 0x05,
   DATA_HELLO = 0x10,
   DATA_ACK = 0x11,
+  VPN_STATUS = 0x12,
   IP_PACKET = 0x20,
   PING = 0x30,
   PONG = 0x31
@@ -29,6 +32,7 @@ export interface HelloAckPayload {
   selectedVersion: number;
   sessionToken: string;
   capabilities: string[];
+  mtu: number;
   message: string;
 }
 
@@ -40,6 +44,16 @@ export interface ErrorPayload {
 
 export interface StopRequestPayload {
   reason: string;
+}
+
+export interface DataHelloPayload {
+  sessionToken: string;
+  role: string;
+}
+
+export interface VpnStatusPayload {
+  state: string;
+  message: string;
 }
 
 export class HnbFrame {
@@ -66,6 +80,10 @@ export function encodeJsonPayload(value: Object): Uint8Array {
     throw new Error('HNB control payload exceeds 16 KiB');
   }
   return encoded;
+}
+
+export function isSupportedMtu(mtu: number): boolean {
+  return Number.isInteger(mtu) && mtu >= HNB_MIN_MTU && mtu <= HNB_MAX_MTU;
 }
 
 export function decodeJsonPayload<T>(payload: Uint8Array): T {
@@ -260,7 +278,7 @@ function validateFrame(type: HnbFrameType, flags: number, sequence: number, payl
 function isKnownType(type: HnbFrameType): boolean {
   return type === HnbFrameType.HELLO || type === HnbFrameType.HELLO_ACK || type === HnbFrameType.ERROR ||
     type === HnbFrameType.STOP_REQUEST || type === HnbFrameType.STOP_ACK || type === HnbFrameType.DATA_HELLO ||
-    type === HnbFrameType.DATA_ACK || type === HnbFrameType.IP_PACKET || type === HnbFrameType.PING ||
+    type === HnbFrameType.DATA_ACK || type === HnbFrameType.VPN_STATUS || type === HnbFrameType.IP_PACKET || type === HnbFrameType.PING ||
     type === HnbFrameType.PONG;
 }
 

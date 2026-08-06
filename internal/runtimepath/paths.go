@@ -9,7 +9,7 @@ import (
 
 const maxUnixSocketPath = 100
 
-// Paths contains every file the Phase 1 daemon may own.
+// Paths contains every local runtime file the daemon may own.
 type Paths struct {
 	RuntimeDir    string
 	ControlSocket string

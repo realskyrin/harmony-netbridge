@@ -16,4 +16,10 @@ cd "${harmony_root}"
   assembleHap \
   --no-daemon
 
-echo "Built ${harmony_root}/entry/build/default/outputs/default/entry-default-unsigned.hap"
+signed_hap="${harmony_root}/entry/build/default/outputs/default/entry-default-signed.hap"
+unsigned_hap="${harmony_root}/entry/build/default/outputs/default/entry-default-unsigned.hap"
+if [[ -f "${signed_hap}" ]]; then
+  echo "Built ${signed_hap}"
+else
+  echo "Built ${unsigned_hap}"
+fi

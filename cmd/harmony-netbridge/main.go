@@ -1,4 +1,4 @@
-// harmony-netbridge is the macOS Phase 1 CLI and background supervisor.
+// harmony-netbridge is the macOS USB VPN bridge CLI and background supervisor.
 package main
 
 import (
@@ -36,6 +36,8 @@ type invocation struct {
 	deviceID    string
 	deviceLabel string
 	devicePort  int
+	mtu         int
+	mtuSet      bool
 	help        bool
 	version     bool
 }
@@ -85,6 +87,10 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) error {
 	if response, err := callDaemon(paths, control.CommandStatus, 300*time.Millisecond); err == nil && response.OK {
 		if response.State.Daemon == state.DaemonRunning {
+			if parsed.mtuSet && response.State.MTU != 0 && response.State.MTU != parsed.mtu {
+				return apperror.New(apperror.CodeDaemonRunning,
+					fmt.Sprintf("HarmonyNetBridge is already running with MTU %d; stop it before changing MTU", response.State.MTU))
+			}
 			fmt.Fprintln(output, "HarmonyNetBridge is already running.")
 			printStatus(output, response.State)
 			return nil
@@ -137,7 +143,8 @@ func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) 
 		"--hdc", hdcPath,
 		"--device", target.ID,
 		"--device-label", target.RedactedName(),
-		"--device-port", strconv.Itoa(daemon.DefaultDevicePort),
+		"--device-port", strconv.Itoa(parsed.devicePort),
+		"--mtu", strconv.Itoa(parsed.mtu),
 	}
 	command := exec.Command(executable, childArguments...)
 	command.Stdin = nil
@@ -268,6 +275,7 @@ func daemonCommand(parsed invocation, paths runtimepath.Paths) error {
 		DeviceID:    parsed.deviceID,
 		DeviceLabel: parsed.deviceLabel,
 		DevicePort:  parsed.devicePort,
+		MTU:         parsed.mtu,
 		Forwarder:   manager,
 		Logger:      logger,
 	})
@@ -305,7 +313,52 @@ func printStatus(output io.Writer, snapshot state.Snapshot) {
 	fmt.Fprintf(output, "Device:    %s\n", device)
 	fmt.Fprintf(output, "Transport: %s\n", snapshot.Transport)
 	fmt.Fprintf(output, "VPN:       %s\n", snapshot.VPN)
+	if snapshot.MTU > 0 {
+		fmt.Fprintf(output, "MTU:       %d\n", snapshot.MTU)
+	}
+	if snapshot.Daemon == state.DaemonRunning && !snapshot.StartedAt.IsZero() {
+		fmt.Fprintf(output, "Uptime:    %s\n", formatDuration(time.Since(snapshot.StartedAt)))
+	}
+	if snapshot.ControlHeartbeatAt.IsZero() && snapshot.DataHeartbeatAt.IsZero() {
+		if snapshot.Transport == state.TransportDataConnected {
+			fmt.Fprintln(output, "Heartbeat: waiting")
+		}
+	} else {
+		fmt.Fprintf(output, "Heartbeat: control %d ms / data %d ms\n", snapshot.ControlRTTMillis, snapshot.DataRTTMillis)
+	}
+	if snapshot.Relay.PacketsFromDevice > 0 || snapshot.Relay.PacketsToDevice > 0 {
+		fmt.Fprintf(output, "Traffic:   device→Mac %s (%d packets) / Mac→device %s (%d packets)\n",
+			formatBytes(snapshot.Relay.BytesFromDevice), snapshot.Relay.PacketsFromDevice,
+			formatBytes(snapshot.Relay.BytesToDevice), snapshot.Relay.PacketsToDevice)
+		fmt.Fprintf(output, "Flows:     TCP %d / UDP %d / DNS %d\n",
+			snapshot.Relay.TCPFlows, snapshot.Relay.UDPFlows, snapshot.Relay.DNSQueries)
+	}
+	if snapshot.Reconnects > 0 {
+		fmt.Fprintf(output, "Reconnects: %d\n", snapshot.Reconnects)
+	}
 	fmt.Fprintf(output, "Message:   %s\n", message)
+}
+
+func formatBytes(value uint64) string {
+	const unit = uint64(1024)
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	amount := float64(value)
+	unitIndex := -1
+	for amount >= float64(unit) && unitIndex+1 < len(units) {
+		amount /= float64(unit)
+		unitIndex++
+	}
+	return fmt.Sprintf("%.1f %s", amount, units[unitIndex])
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration < 0 {
+		duration = 0
+	}
+	return duration.Round(time.Second).String()
 }
 
 func printError(output io.Writer, err error) int {
@@ -327,7 +380,7 @@ func printError(output io.Writer, err error) int {
 }
 
 func parseInvocation(arguments []string) (invocation, error) {
-	parsed := invocation{devicePort: daemon.DefaultDevicePort}
+	parsed := invocation{devicePort: daemon.DefaultDevicePort, mtu: daemon.DefaultMTU}
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
 		switch argument {
@@ -340,7 +393,7 @@ func parseInvocation(arguments []string) (invocation, error) {
 			parsed.help = true
 		case "--version":
 			parsed.version = true
-		case "--hdc", "--device", "--device-label", "--device-port":
+		case "--hdc", "--device", "--device-label", "--device-port", "--mtu":
 			if index+1 >= len(arguments) {
 				return invocation{}, fmt.Errorf("%s requires a value", argument)
 			}
@@ -350,7 +403,7 @@ func parseInvocation(arguments []string) (invocation, error) {
 			}
 		default:
 			name, value, found := strings.Cut(argument, "=")
-			if found && (name == "--hdc" || name == "--device" || name == "--device-label" || name == "--device-port") {
+			if found && (name == "--hdc" || name == "--device" || name == "--device-label" || name == "--device-port" || name == "--mtu") {
 				if err := assignOption(&parsed, name, value); err != nil {
 					return invocation{}, err
 				}
@@ -364,6 +417,9 @@ func parseInvocation(arguments []string) (invocation, error) {
 	}
 	if parsed.command != "__daemon" && parsed.deviceLabel != "" {
 		return invocation{}, errors.New("--device-label is an internal option")
+	}
+	if parsed.mtuSet && parsed.command != "start" && parsed.command != "__daemon" {
+		return invocation{}, errors.New("--mtu is only valid with start")
 	}
 	return parsed, nil
 }
@@ -385,26 +441,34 @@ func assignOption(parsed *invocation, name, value string) error {
 			return errors.New("--device-port must be an integer in 1...65535")
 		}
 		parsed.devicePort = port
+	case "--mtu":
+		mtu, err := strconv.Atoi(value)
+		if err != nil || mtu < daemon.MinimumMTU || mtu > daemon.MaximumMTU {
+			return fmt.Errorf("--mtu must be an integer in %d...%d", daemon.MinimumMTU, daemon.MaximumMTU)
+		}
+		parsed.mtu = mtu
+		parsed.mtuSet = true
 	}
 	return nil
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, `HarmonyNetBridge Phase 1
+	fmt.Fprintln(output, `HarmonyNetBridge Phase 3
 
 Usage:
-  harmony-netbridge [--hdc <path>] [--device <target>] start
+  harmony-netbridge [--hdc <path>] [--device <target>] [--mtu <bytes>] start
   harmony-netbridge status
   harmony-netbridge stop
 
 Commands:
-  start    Start the per-user bridge daemon and wait for the Harmony App
+  start    Start the per-user bridge daemon and USB packet relay
   status   Read live daemon, transport, and VPN state
   stop     Stop the daemon and remove only its owned hdc mapping
 
 Options:
   --hdc <path>       Explicit hdc executable (also HARMONY_NETBRIDGE_HDC)
   --device <target>  Select one target when multiple devices are Connected
+  --mtu <bytes>      VPN MTU in 576...1500 (default 1400)
   --version          Print the CLI version
   -h, --help         Show this help`)
 }

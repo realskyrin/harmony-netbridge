@@ -1,6 +1,6 @@
 # HarmonyNetBridge 技术方案设计文档
 
-> 状态：已批准的系统设计，尚未进入编码
+> 状态：已批准；Phase 1、Gate V、Phase 2 IPv4 MVP 与 Phase 3 单设备稳定性能力已按本设计实施
 >
 > 日期：2026-08-06
 >
@@ -788,17 +788,16 @@ Gate V 失败时必须记录具体系统错误和设备条件。Lite 仍可继�
 - mitmproxy/Charles 证书和代理凭据不进入仓库、状态文件或普通日志。
 - 项目 README 必须明确这是开发调试工具，会转发设备网络流量。
 
-## 21. 进入实现前的门槛
+## 21. 实施检查点
 
-本设计批准后，下一步仍不是直接实现全部项目，而是：
+本设计批准后的实际实施保持了分阶段门槛：
 
-1. 用户审核本文件并确认无需修改。
-2. 用户提供或确认 Go module 远程路径和 Harmony bundle ID。
-3. 为 Phase 1 单独编写实施计划。
-4. 只实现 Phase 1，并按 Phase 1 验收标准验证。
-5. Phase 1 完成后执行 Gate V，再决定完整 VPN Phase 2。
+1. Phase 1 完成 CLI、hdc、App 与真实 hello/world。
+2. Gate V 在物理设备上验证第三方 VPN 授权、`protect()`、受限路由、TUN read 与 `destroy()`。
+3. Gate 通过后才启用默认 IPv4 路由，并实现独立 Control/Data、Native PacketPump 与 gVisor relay。
+4. Phase 2 的实现、当前真机证据和未验证边界单独记录在 [`docs/phase-2.md`](../phase-2.md)。
 
-当前 USB 目标仍为 `Offline`。任何 Phase 1 真机完成声明都必须等待设备恢复 `Connected` 后重新获取运行证据。
+Phase 3 与 Phase 4 仍需独立验收，不能把当前 IPv4 MVP 表述为已完成重连、多设备、IPv6或抓包自动化。
 
 ## 22. 参考资料
 

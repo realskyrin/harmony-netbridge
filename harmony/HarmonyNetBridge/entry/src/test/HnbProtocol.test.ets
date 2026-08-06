@@ -10,6 +10,7 @@ import {
   HnbFrame,
   HnbFrameDecoder,
   HnbFrameType,
+  isSupportedMtu,
   StopRequestPayload
 } from '../main/ets/bridge/HnbProtocol';
 
@@ -103,6 +104,15 @@ export default function hnbProtocolTest(): void {
         rejected = true;
       }
       expect(rejected).assertTrue();
+    });
+
+    it('validatesNegotiatedMtu', 0, () => {
+      expect(isSupportedMtu(576)).assertTrue();
+      expect(isSupportedMtu(1280)).assertTrue();
+      expect(isSupportedMtu(1500)).assertTrue();
+      expect(isSupportedMtu(575)).assertFalse();
+      expect(isSupportedMtu(1501)).assertFalse();
+      expect(isSupportedMtu(1280.5)).assertFalse();
     });
   });
 }

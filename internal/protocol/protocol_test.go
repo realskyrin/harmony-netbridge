@@ -167,6 +167,22 @@ func TestReadFrameReportsTruncatedPayload(t *testing.T) {
 	}
 }
 
+func TestValidSessionTokenRequiresLowercaseHex(t *testing.T) {
+	t.Parallel()
+	if !ValidSessionToken("0123456789abcdef0123456789abcdef") {
+		t.Fatal("ValidSessionToken rejected lowercase token")
+	}
+	for _, token := range []string{
+		"0123456789ABCDEF0123456789ABCDEF",
+		"0123456789abcdef",
+		"0123456789abcdef0123456789abcdeg",
+	} {
+		if ValidSessionToken(token) {
+			t.Fatalf("ValidSessionToken accepted %q", token)
+		}
+	}
+}
+
 func TestNewSessionTokenFormatAndUniqueness(t *testing.T) {
 	t.Parallel()
 	first, err := NewSessionToken()
@@ -182,6 +198,26 @@ func TestNewSessionTokenFormatAndUniqueness(t *testing.T) {
 	}
 	if first == second {
 		t.Fatal("two generated session tokens are equal")
+	}
+}
+
+func TestHelloAckCarriesNegotiatedMTU(t *testing.T) {
+	payload, err := MarshalJSONPayload(HelloAck{
+		SelectedVersion: CurrentVersion,
+		SessionToken:    "0123456789abcdef0123456789abcdef",
+		Capabilities:    []string{"control", "data", "heartbeat", "reconnect", "mtu"},
+		MTU:             1280,
+		Message:         "world",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded HelloAck
+	if err := UnmarshalJSONPayload(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.MTU != 1280 {
+		t.Fatalf("decoded MTU = %d", decoded.MTU)
 	}
 }
 

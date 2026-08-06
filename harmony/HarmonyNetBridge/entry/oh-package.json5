@@ -5,5 +5,7 @@
   "main": "",
   "author": "HarmonyNetBridge Contributors",
   "license": "Apache-2.0",
-  "dependencies": {}
+  "dependencies": {
+    "libhnb.so": "file:./src/main/cpp/types/libhnb"
+  }
 }

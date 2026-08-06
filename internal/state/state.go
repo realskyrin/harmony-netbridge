@@ -30,31 +30,51 @@ const (
 	VPNUnavailable  VPNStatus = "UNAVAILABLE"
 	VPNAuthRequired VPNStatus = "AUTH_REQUIRED"
 	VPNStarting     VPNStatus = "STARTING"
+	VPNReconnecting VPNStatus = "RECONNECTING"
 	VPNActive       VPNStatus = "ACTIVE"
 	VPNStopped      VPNStatus = "STOPPED"
 	VPNFailed       VPNStatus = "FAILED"
 )
 
+// RelayStats contains aggregate, payload-free data-plane counters. It never
+// contains addresses, ports, packet contents, or session identifiers.
+type RelayStats struct {
+	PacketsFromDevice uint64 `json:"packetsFromDevice"`
+	BytesFromDevice   uint64 `json:"bytesFromDevice"`
+	PacketsToDevice   uint64 `json:"packetsToDevice"`
+	BytesToDevice     uint64 `json:"bytesToDevice"`
+	TCPFlows          uint64 `json:"tcpFlows"`
+	UDPFlows          uint64 `json:"udpFlows"`
+	DNSQueries        uint64 `json:"dnsQueries"`
+}
+
 // Snapshot is returned by status and persisted for diagnostics. Device is always redacted.
 type Snapshot struct {
-	SchemaVersion int             `json:"schemaVersion"`
-	Daemon        DaemonStatus    `json:"daemon"`
-	Transport     TransportStatus `json:"transport"`
-	VPN           VPNStatus       `json:"vpn"`
-	Device        string          `json:"device,omitempty"`
-	DevicePort    int             `json:"devicePort,omitempty"`
-	HostPort      int             `json:"hostPort,omitempty"`
-	Message       string          `json:"message,omitempty"`
-	LastErrorCode string          `json:"lastErrorCode,omitempty"`
-	LastError     string          `json:"lastError,omitempty"`
-	StartedAt     time.Time       `json:"startedAt,omitempty"`
-	UpdatedAt     time.Time       `json:"updatedAt"`
+	SchemaVersion      int             `json:"schemaVersion"`
+	Daemon             DaemonStatus    `json:"daemon"`
+	Transport          TransportStatus `json:"transport"`
+	VPN                VPNStatus       `json:"vpn"`
+	Device             string          `json:"device,omitempty"`
+	DevicePort         int             `json:"devicePort,omitempty"`
+	HostPort           int             `json:"hostPort,omitempty"`
+	MTU                int             `json:"mtu,omitempty"`
+	Reconnects         uint64          `json:"reconnects,omitempty"`
+	ControlHeartbeatAt time.Time       `json:"controlHeartbeatAt,omitempty"`
+	ControlRTTMillis   int64           `json:"controlRttMillis,omitempty"`
+	DataHeartbeatAt    time.Time       `json:"dataHeartbeatAt,omitempty"`
+	DataRTTMillis      int64           `json:"dataRttMillis,omitempty"`
+	Relay              RelayStats      `json:"relay"`
+	Message            string          `json:"message,omitempty"`
+	LastErrorCode      string          `json:"lastErrorCode,omitempty"`
+	LastError          string          `json:"lastError,omitempty"`
+	StartedAt          time.Time       `json:"startedAt,omitempty"`
+	UpdatedAt          time.Time       `json:"updatedAt"`
 }
 
 // NewStarting creates the first daemon state.
 func NewStarting(now time.Time, device string, devicePort int) Snapshot {
 	return Snapshot{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Daemon:        DaemonStarting,
 		Transport:     TransportNoDevice,
 		VPN:           VPNStopped,
@@ -69,7 +89,7 @@ func NewStarting(now time.Time, device string, devicePort int) Snapshot {
 // Stopped creates a status response when no daemon is reachable.
 func Stopped(now time.Time) Snapshot {
 	return Snapshot{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Daemon:        DaemonStopped,
 		Transport:     TransportNoDevice,
 		VPN:           VPNStopped,

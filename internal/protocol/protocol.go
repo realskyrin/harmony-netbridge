@@ -31,6 +31,7 @@ const (
 
 	TypeDataHello Type = 0x10
 	TypeDataAck   Type = 0x11
+	TypeVPNStatus Type = 0x12
 	TypeIPPacket  Type = 0x20
 
 	TypePing Type = 0x30
@@ -68,6 +69,7 @@ type HelloAck struct {
 	SelectedVersion uint8    `json:"selectedVersion"`
 	SessionToken    string   `json:"sessionToken"`
 	Capabilities    []string `json:"capabilities"`
+	MTU             int      `json:"mtu"`
 	Message         string   `json:"message"`
 }
 
@@ -81,6 +83,18 @@ type ErrorPayload struct {
 // StopRequest asks the peer to close the current bridge session.
 type StopRequest struct {
 	Reason string `json:"reason"`
+}
+
+// DataHello binds the native data socket to a live VPN control session.
+type DataHello struct {
+	SessionToken string `json:"sessionToken"`
+	Role         string `json:"role"`
+}
+
+// VPNStatusPayload reports the device-side VPN lifecycle to the Mac daemon.
+type VPNStatusPayload struct {
+	State   string `json:"state"`
+	Message string `json:"message"`
 }
 
 // NewSessionToken returns 16 random bytes encoded as 32 lowercase hex characters.
@@ -123,6 +137,21 @@ func SupportsVersion(versions []int) bool {
 		}
 	}
 	return false
+}
+
+// ValidSessionToken accepts exactly the random token encoding produced by
+// NewSessionToken without logging or otherwise exposing it.
+func ValidSessionToken(token string) bool {
+	if len(token) != 32 {
+		return false
+	}
+	for _, character := range token {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	_, err := hex.DecodeString(token)
+	return err == nil
 }
 
 // WriteFrame writes one complete HNB/1 frame.
@@ -208,7 +237,7 @@ func validateLength(frameType Type, length uint32) error {
 func knownType(frameType Type) bool {
 	switch frameType {
 	case TypeHello, TypeHelloAck, TypeError, TypeStopRequest, TypeStopAck,
-		TypeDataHello, TypeDataAck, TypeIPPacket, TypePing, TypePong:
+		TypeDataHello, TypeDataAck, TypeVPNStatus, TypeIPPacket, TypePing, TypePong:
 		return true
 	default:
 		return false

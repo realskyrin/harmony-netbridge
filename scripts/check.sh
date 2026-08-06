@@ -6,7 +6,7 @@ check_dir="$(mktemp -d /tmp/hnb-check.XXXXXX)"
 trap 'rm -rf "${check_dir}"' EXIT
 
 cd "${project_root}"
-go test ./...
+go test -race ./...
 go vet ./...
 GOOS=darwin GOARCH=arm64 go build -trimpath -o "${check_dir}/harmony-netbridge" ./cmd/harmony-netbridge
 "${project_root}/scripts/test-harmony.sh"
@@ -17,7 +17,7 @@ module_profile="$(unzip -p "${hap_file}" module.json)"
 case "${module_profile}" in
   *'"type":"vpn"'*) ;;
   *)
-    echo "Built HAP is missing the VPN extension skeleton." >&2
+    echo "Built HAP is missing the VPN extension." >&2
     exit 1
     ;;
 esac
@@ -30,9 +30,9 @@ case "${module_profile}" in
 esac
 case "${module_profile}" in
   *'MANAGE_VPN'*)
-    echo "Phase 1 HAP must not request MANAGE_VPN." >&2
+    echo "Third-party VPN HAP must not request MANAGE_VPN." >&2
     exit 1
     ;;
 esac
 
-echo "HarmonyNetBridge Phase 1 static and host checks passed."
+echo "HarmonyNetBridge Phase 3 static and host checks passed."

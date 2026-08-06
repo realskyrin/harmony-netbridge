@@ -3,7 +3,7 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { bridgeSession } from '../bridge/BridgeSession';
 
-const DOMAIN: number = 0x484E42;
+const DOMAIN: number = 0x484E;
 const TAG: string = 'HarmonyNetBridge';
 
 export default class EntryAbility extends UIAbility {

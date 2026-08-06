@@ -1,0 +1,6 @@
+{
+  "name": "libhnb.so",
+  "types": "./index.d.ts",
+  "version": "0.3.0",
+  "description": "HarmonyNetBridge native TUN packet pump"
+}

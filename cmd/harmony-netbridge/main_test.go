@@ -31,6 +31,19 @@ func TestParseInvocationAcceptsOptionsBeforeOrAfterCommand(t *testing.T) {
 		if parsed.devicePort != daemon.DefaultDevicePort {
 			t.Fatalf("device port = %d", parsed.devicePort)
 		}
+		if parsed.mtu != daemon.DefaultMTU {
+			t.Fatalf("MTU = %d", parsed.mtu)
+		}
+	}
+}
+
+func TestParseInvocationAcceptsConfiguredMTU(t *testing.T) {
+	parsed, err := parseInvocation([]string{"start", "--mtu", "1280"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.mtu != 1280 {
+		t.Fatalf("MTU = %d, want 1280", parsed.mtu)
 	}
 }
 
@@ -74,7 +87,11 @@ func TestRecentDaemonFailureRejectsStaleStateAndReturnsCurrentError(t *testing.T
 }
 
 func TestParseInvocationRejectsUnknownAndMultipleCommands(t *testing.T) {
-	for _, arguments := range [][]string{{"devices"}, {"start", "stop"}, {"start", "--device-port", "0"}} {
+	for _, arguments := range [][]string{
+		{"devices"}, {"start", "stop"}, {"start", "--device-port", "0"},
+		{"start", "--mtu", "575"}, {"start", "--mtu", "1501"},
+		{"status", "--mtu", "1280"},
+	} {
 		if _, err := parseInvocation(arguments); err == nil {
 			t.Fatalf("parseInvocation(%v) error = nil", arguments)
 		}
@@ -88,11 +105,21 @@ func TestPrintStatusDoesNotExposeRawDeviceID(t *testing.T) {
 		Transport: state.TransportPortReady,
 		VPN:       state.VPNStopped,
 		Device:    "device-deadbeef",
-		Message:   "Waiting for HarmonyNetBridge App",
+		MTU:       1280,
+		Relay: state.RelayStats{
+			PacketsFromDevice: 2,
+			BytesFromDevice:   2048,
+			PacketsToDevice:   1,
+			BytesToDevice:     1024,
+		},
+		Message: "Waiting for HarmonyNetBridge App",
 	})
 	text := output.String()
 	if !strings.Contains(text, "device-deadbeef") || strings.Contains(text, "secret-device-id") {
 		t.Fatalf("unexpected status output: %s", text)
+	}
+	if !strings.Contains(text, "MTU:       1280") || !strings.Contains(text, "device→Mac 2.0 KiB") {
+		t.Fatalf("status is missing Phase 3 metrics: %s", text)
 	}
 }
 

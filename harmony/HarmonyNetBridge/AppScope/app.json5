@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "io.github.realskyrin.harmonynetbridge",
     "vendor": "HarmonyNetBridge Contributors",
-    "versionCode": 1000000,
-    "versionName": "0.1.0",
+    "versionCode": 3000000,
+    "versionName": "0.3.0",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
