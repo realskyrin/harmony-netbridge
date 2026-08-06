@@ -2,7 +2,7 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "HarmonyNetBridge Phase 4 USB IPv4 VPN and capture bridge"
+      "value": "HarmonyNetBridge USB network and capture bridge"
     },
     {
       "name": "entry_ability_desc",

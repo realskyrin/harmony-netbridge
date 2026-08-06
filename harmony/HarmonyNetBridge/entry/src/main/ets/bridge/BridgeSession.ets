@@ -182,8 +182,8 @@ export class BridgeSession {
         }
         this.publish(new BridgeSnapshot(
           BridgeConnectionState.CONNECTED,
-          'hello / world 成功',
-          'Phase 1 USB 控制通道已连接'
+          'Mac 控制通道已连接',
+          'USB 通信正常，可以开始使用 VPN Tunnel'
         ));
         return;
       }
@@ -210,7 +210,7 @@ export class BridgeSession {
         return;
       }
       default:
-        throw new Error(`Phase 1 received unexpected frame type ${frame.type}`);
+        throw new Error(`控制通道收到不支持的消息类型：${frame.type}`);
     }
   }
 
@@ -253,7 +253,7 @@ export class BridgeSession {
       this.publish(new BridgeSnapshot(
         BridgeConnectionState.DISCONNECTED,
         'Mac 连接已断开',
-        'Phase 1 不自动重连，请检查 USB 与 CLI 后手动重试'
+        '请检查 USB 与 Mac 服务，然后手动重新连接'
       ));
     }
   }
@@ -278,7 +278,8 @@ export class BridgeSession {
   }
 
   private safeBusinessError(error: BusinessError): string {
-    return error.code === undefined ? '网络连接失败' : `错误 ${error.code}：${error.message}`;
+    return error.code === undefined ? '无法建立 USB 连接，请检查 Mac 服务' :
+      `无法建立 USB 连接，请检查 Mac 服务（错误 ${error.code}）`;
   }
 }
 
