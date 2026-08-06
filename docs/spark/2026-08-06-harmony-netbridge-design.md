@@ -42,7 +42,7 @@ HarmonyNetBridge 是一个开源开发者工具，目标是在不依赖 Android 
 
 项目在 API 层面具备可行性，但完整 VPN 的最终可行性仍然是“有条件成立”：
 
-1. HarmonyOS NEXT 的公开 `@ohos.net.vpnExtension` API 可以创建第三方用户态 VPN、返回虚拟网卡 fd、配置地址/路由/DNS，并保护隧道 socket 免受 VPN 递归捕获。
+1. HarmonyOS NEXT 的公开 `vpnExtension` API（当前通过 `@kit.NetworkKit` 导入）可以创建第三方用户态 VPN、返回虚拟网卡 fd、配置地址/路由/DNS，并保护隧道 socket 免受 VPN 递归捕获。
 2. hdc 提供与 adb forward/reverse 对应的 `fport` 和 `rport`。HarmonyNetBridge 应使用设备到 Mac 方向的 `rport`。
 3. VPN 可以持续运行，但并非不受系统生命周期约束的永久守护进程。首次启用需要用户信任，同时只能存在一个活动 VPN；调用进程或 VPN 服务进程退出时连接会停止。
 4. hdc `rport` + loopback TCP 是当前开发者场景下最合适的 USB 通信方案。它不需要自行实现 USB 协议，但其长期传输稳定性必须真机验证。
@@ -94,7 +94,7 @@ Phase 4：mitmproxy/Charles 开发体验自动化
 
 结论：API 模型满足。
 
-使用公开的 `@ohos.net.vpnExtension`，而不是需要系统权限的 `@ohos.net.vpn`。所需能力包括：
+使用 `@kit.NetworkKit` 中公开的 `vpnExtension`，而不是需要系统权限的系统级 VPN 管理接口。所需能力包括：
 
 - 通过 `startVpnExtensionAbility()` 启动 VPN Extension。
 - 通过 `createVpnConnection(context)` 创建 VPN 控制对象。
@@ -232,7 +232,7 @@ Lite 的 HTTP/SOCKS 流量保持原生协议，不套 HNB 帧。它使用独立�
 | CLI 基础 | Go 标准库优先 | Phase 1 不引入不必要的 CLI 框架 |
 | 日志 | `log/slog` + 大小轮转 | 结构化、可脱敏、方便诊断 |
 | Harmony UI / 生命周期 | ArkTS + Stage 模型 | 官方应用与 Extension 模型 |
-| VPN | `@ohos.net.vpnExtension` | 面向第三方应用的公开 API |
+| VPN | `@kit.NetworkKit` / `vpnExtension` | 面向第三方应用的公开 API |
 | 数据泵 | Native C++ / Node-API | 直接操作 TUN fd 与数据 socket，减少逐包跨层复制 |
 | USB 通道 | hdc `rport` | 官方开发连接工具，避免自定义 USB 协议 |
 | Phase 2 用户态栈 | 固定版本的 gVisor Netstack，封装在 `relay.Engine` 后 | 优先保持单个 Go 二进制，避免自写 TCP 栈 |
@@ -300,7 +300,7 @@ harmony-netbridge stop
 
 ### 9.3 设备选择
 
-- 只把 `Online` 目标视为可用。
+- 只把 `Connected`（当前 hdc 3.x）或兼容旧输出的 `Online` 目标视为可用。
 - 0 个在线目标：返回 `NO_DEVICE` 或 `DEVICE_OFFLINE`。
 - 1 个在线目标：自动选择。
 - 多个在线目标：要求显式 `--device`。
@@ -798,7 +798,7 @@ Gate V 失败时必须记录具体系统错误和设备条件。Lite 仍可继�
 4. 只实现 Phase 1，并按 Phase 1 验收标准验证。
 5. Phase 1 完成后执行 Gate V，再决定完整 VPN Phase 2。
 
-当前 USB 目标仍为 `Offline`。任何 Phase 1 真机完成声明都必须等待设备恢复 `Online` 后重新获取运行证据。
+当前 USB 目标仍为 `Offline`。任何 Phase 1 真机完成声明都必须等待设备恢复 `Connected` 后重新获取运行证据。
 
 ## 22. 参考资料
 

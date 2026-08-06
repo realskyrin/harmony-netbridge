@@ -1,0 +1,22 @@
+# Go
+/bin/
+/dist/
+*.test
+
+# HarmonyOS / DevEco Studio
+**/oh_modules/
+**/node_modules/
+**/build/
+**/.preview/
+**/.test/
+**/.hvigor/
+**/.idea/
+**/local.properties
+**/.appanalyzer/
+**/.cxx/
+
+# macOS
+.DS_Store
+
+# Runtime artifacts
+*.log

@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${HNB_FAKE_HDC_LOG:-}" ]; then
+  printf '%s\n' "$*" >>"${HNB_FAKE_HDC_LOG}"
+fi
+
+case "${1:-}" in
+  -v)
+    printf '%s\n' 'Ver: test-3.2.0'
+    ;;
+  list)
+    printf '%s\n' 'fixture-device USB Connected localhost'
+    ;;
+  -t)
+    case "${3:-}" in
+      rport)
+        printf '%s\n' 'Forwardport result:OK'
+        ;;
+      fport)
+        if [ "${4:-}" = 'rm' ]; then
+          printf '%s\n' 'Remove forward ruler success'
+        else
+          printf '%s\n' '[Fail] unsupported fake fport command'
+          exit 1
+        fi
+        ;;
+      *)
+        printf '%s\n' '[Fail] unsupported fake target command'
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    printf '%s\n' '[Fail] unsupported fake hdc command'
+    exit 1
+    ;;
+esac

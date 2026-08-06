@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "HarmonyNetBridge Phase 1 USB control bridge"
+    },
+    {
+      "name": "entry_ability_desc",
+      "value": "Connects to the HarmonyNetBridge Mac CLI over hdc"
+    },
+    {
+      "name": "entry_ability_label",
+      "value": "HarmonyNetBridge"
+    },
+    {
+      "name": "vpn_extension_desc",
+      "value": "VPN lifecycle skeleton reserved for Gate V and Phase 2"
+    }
+  ]
+}
