@@ -8,8 +8,9 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 
 - `harmony-netbridge start/proxy/status/stop`：管理单设备 daemon、`hdc rport`、实时状态和安全停止。
 - `proxy` 自动发现并启动 mitmweb，使用独立 `.mitm` capture、项目专属 CA 目录和 loopback Web UI；停止 daemon 时只终止本次受管进程。
+- `proxy --upstream <URL>` 可让 mitmweb 经指定 HTTP(S) upstream 出网；默认严格校验上游 TLS，开发调试时可显式传入 `--ssl-insecure`。
 - 抓包模式通过 relay 内部 HTTP `CONNECT` 接入 mitmweb，不修改手机全局 HTTP proxy，也不依赖无法可靠回读的系统代理配置。
-- HTTP 可直接抓取；App 可把 Mac 项目目录中的 `mitmproxy-ca-cert.cer` 经现有 hdc 通道保存到手机，并用系统证书管理器打开。最终安装与信任仍由用户在系统界面确认。
+- HTTP 可直接抓取；App 可把 Mac 当前受管 `mitmproxy-ca-cert.cer` 经现有 hdc 通道保存到手机，并用系统证书管理器打开。最终安装与信任仍由用户在系统界面确认。
 - 抓包模式拦截 TCP 80/443/8080/8443；UDP/443 被拒绝以促使 QUIC 回退 TCP，其他 UDP、DNS 和非 HTTP TCP 仍按标准模式转发。
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
 - HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
@@ -144,6 +145,22 @@ HarmonyOS App：
 ./bin/harmony-netbridge proxy --no-open-browser
 ```
 
+若本机通过监听 `127.0.0.1:3128` 的代理访问外网，可将它配置为 mitmweb 的 upstream：
+
+```bash
+./bin/harmony-netbridge proxy --upstream http://127.0.0.1:3128
+```
+
+`--upstream` 只接受不含账号密码、路径、查询参数或 fragment 的 `http://`/`https://` URL，避免凭据出现在受管子进程命令行中。
+
+若企业 upstream 替换 HTTPS 证书，而 mitmweb 的 Python 信任库无法构建该证书链，可在本次开发调试中显式关闭 mitmweb 的上游 TLS 校验：
+
+```bash
+./bin/harmony-netbridge proxy --upstream http://127.0.0.1:3128 --ssl-insecure
+```
+
+该开关不会替代手机对 mitmproxy CA 的信任，只影响 mitmweb 到 upstream/目标服务器的 TLS 身份校验。默认仍严格校验；启用后 `status` 会明确显示 `TLS verify: DISABLED`。
+
 随后在 App 点击“启动 VPN”，再点击“验证 HTTP 抓包链路”。HTTP 可立即在 mitmweb 中查看。HTTPS 请点击“下载 Mac CA 证书”，下载完成后点击“用证书管理器打开”，再由 HarmonyOS 系统界面确认安装与信任；不再需要去外部站点下载。App pinning、企业策略或不信任用户 CA 的应用仍可能拒绝解密，这不是隧道故障。
 
 `status` 会显示代理状态、capture 文件、公共 CA 路径、已接入代理的 TCP flow 数和 QUIC 回退计数，但不会显示 mitmweb token、请求头或 flow 内容。默认文件位于：
@@ -177,7 +194,7 @@ capture、日志与 CA 文件使用 `0600`，所属目录使用 `0700`。停止�
 - MTU 参数边界、双通道心跳、心跳 RTT 状态与单设备重连计数。
 - gVisor 内存网络中的真实 TCP、UDP、UDP DNS 与 TCP DNS 往返。
 - HTTP CONNECT 适配、非 2xx/超长响应拒绝、buffered tunnel 数据保留、代理 flow 统计与 UDP/443 回退。
-- mitmweb 受管生命周期、私有 capture/CA 权限、只读 CA 下载端点和精确 orphan 识别。
+- mitmweb upstream 参数、TLS 校验开关、受管生命周期、私有 capture/CA 权限、两个只读 CA 下载端点和精确 orphan 识别。
 - macOS resolver 失效刷新与 UDP DNS 截断后的 TCP 重试。
 - ArkTS 协议、MTU、重连退避、DNS TCP 分片、CA 下载响应边界与 `mitm.it` 响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,8 @@ type Config struct {
 	CaptureFile string
 	ConfDir     string
 	LogFile     string
+	UpstreamURL string
+	SSLInsecure bool
 }
 
 // Session owns one exact mitmweb child process and its CONNECT dialer.
@@ -151,6 +154,8 @@ func Start(config Config) (*Session, error) {
 			CaptureFile:    config.CaptureFile,
 			CACertFile:     filepath.Join(config.ConfDir, "mitmproxy-ca-cert.cer"),
 			ConfDir:        config.ConfDir,
+			UpstreamURL:    config.UpstreamURL,
+			SSLInsecure:    config.SSLInsecure,
 			InterceptPorts: interceptPorts,
 		},
 		cmd:    command,
@@ -280,8 +285,12 @@ func loopbackReady(address string) bool {
 }
 
 func managedArguments(config Config) []string {
+	mode := "regular"
+	if config.UpstreamURL != "" {
+		mode = "upstream:" + config.UpstreamURL
+	}
 	args := []string{
-		"--mode", "regular",
+		"--mode", mode,
 		"--listen-host", "127.0.0.1",
 		"--listen-port", strconv.Itoa(config.ListenPort),
 		"--web-host", "127.0.0.1",
@@ -292,6 +301,9 @@ func managedArguments(config Config) []string {
 		args = append(args, "--web-open-browser")
 	} else {
 		args = append(args, "--no-web-open-browser")
+	}
+	if config.SSLInsecure {
+		args = append(args, "--set", "ssl_insecure=true")
 	}
 	return append(args,
 		"--save-stream-file", config.CaptureFile,
@@ -304,6 +316,9 @@ func validateConfig(config Config) error {
 		!filepath.IsAbs(config.ConfDir) || !filepath.IsAbs(config.LogFile) {
 		return errors.New("mitmweb executable and owned paths must be absolute")
 	}
+	if err := ValidateUpstreamURL(config.UpstreamURL); err != nil {
+		return err
+	}
 	if config.ListenPort < 1 || config.ListenPort > 65_535 || config.WebPort < 1 || config.WebPort > 65_535 {
 		return errors.New("mitmweb ports must be in 1...65535")
 	}
@@ -313,6 +328,25 @@ func validateConfig(config Config) error {
 	info, err := os.Stat(config.Executable)
 	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 		return errors.New("mitmweb executable is not runnable")
+	}
+	return nil
+}
+
+// ValidateUpstreamURL accepts mitmproxy upstream host specifications without
+// credentials that would be exposed in the child process command line.
+func ValidateUpstreamURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	upstream, err := url.Parse(rawURL)
+	if err != nil || (upstream.Scheme != "http" && upstream.Scheme != "https") || upstream.Hostname() == "" {
+		return errors.New("upstream must be an http:// or https:// URL with a host")
+	}
+	if upstream.User != nil {
+		return errors.New("upstream URL must not contain credentials")
+	}
+	if upstream.Path != "" || upstream.RawQuery != "" || upstream.Fragment != "" || upstream.ForceQuery {
+		return errors.New("upstream URL must contain only a scheme, host, and optional port")
 	}
 	return nil
 }
@@ -365,10 +399,14 @@ func RecoverManaged(previous state.ProxySnapshot) error {
 	}
 	required := []string{
 		previous.Executable,
+		"--mode " + managedMode(previous.UpstreamURL),
 		"--listen-port " + strconv.Itoa(previous.ListenPort),
 		"--web-port " + strconv.Itoa(previous.WebPort),
 		"--save-stream-file " + previous.CaptureFile,
 		"confdir=" + previous.ConfDir,
+	}
+	if previous.SSLInsecure {
+		required = append(required, "ssl_insecure=true")
 	}
 	for _, marker := range required {
 		if marker == "" || !strings.Contains(command, marker) {
@@ -398,6 +436,13 @@ func RecoverManaged(previous state.ProxySnapshot) error {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return errors.New("orphaned mitmweb did not exit after a bounded termination")
+}
+
+func managedMode(upstreamURL string) string {
+	if upstreamURL == "" {
+		return "regular"
+	}
+	return "upstream:" + upstreamURL
 }
 
 func processCommand(pid int) (string, error) {

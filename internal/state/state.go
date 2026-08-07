@@ -70,6 +70,8 @@ type ProxySnapshot struct {
 	CaptureFile    string      `json:"captureFile,omitempty"`
 	CACertFile     string      `json:"caCertFile,omitempty"`
 	ConfDir        string      `json:"confDir,omitempty"`
+	UpstreamURL    string      `json:"upstreamUrl,omitempty"`
+	SSLInsecure    bool        `json:"sslInsecure,omitempty"`
 	InterceptPorts []int       `json:"interceptPorts,omitempty"`
 }
 

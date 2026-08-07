@@ -7,7 +7,7 @@ Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修�
 已实现：
 
 - `harmony-netbridge proxy`：检查 `mitmweb`、启动 loopback regular proxy 与 Web UI、创建独立 `.mitm` capture，并继续启动原有 VPN relay。
-- 可配置 `--mitmweb`、`--proxy-port`、`--web-port`、`--no-open-browser` 与原有 `--mtu`。
+- 可配置 `--mitmweb`、`--proxy-port`、`--web-port`、`--upstream`、`--ssl-insecure`、`--no-open-browser` 与原有 `--mtu`。
 - gVisor 收到 TCP 80/443/8080/8443 flow 后，Mac 侧先向 mitmweb 发送有界 HTTP `CONNECT`；成功后才桥接设备 TCP。其他 TCP、UDP 与 DNS 仍使用 Mac 直连。
 - 代理模式拒绝 UDP/443，促使支持回退的客户端从 HTTP/3/QUIC 改用可抓取的 TCP。此行为不会伪装成已抓取 HTTP/3。
 - HNB/1 `HELLO_ACK.capabilities` 增加可选 `proxy`；Harmony App 据此展示模式并提供 `http://mitm.it` HTTP 链路自检。
@@ -47,6 +47,8 @@ Mac gVisor relay
 ./bin/harmony-netbridge proxy
 ./bin/harmony-netbridge proxy --mtu 1280 --proxy-port 9080 --web-port 9081
 ./bin/harmony-netbridge proxy --mitmweb /opt/homebrew/bin/mitmweb --no-open-browser
+./bin/harmony-netbridge proxy --upstream http://127.0.0.1:3128
+./bin/harmony-netbridge proxy --upstream http://127.0.0.1:3128 --ssl-insecure
 ./bin/harmony-netbridge status
 ./bin/harmony-netbridge stop
 ```
@@ -64,7 +66,7 @@ Mac gVisor relay
 | mitmweb log | `~/Library/Logs/HarmonyNetBridge/mitmweb.log` | `0600` |
 | daemon state | `~/Library/Caches/HarmonyNetBridge/runtime/state.json` | `0600` |
 
-状态只保存受管进程恢复所需的 PID、可执行文件、端口和项目路径；不保存 Web UI token、代理凭据、请求头、目标地址、DNS 名称或 flow payload。capture 在停止后保留，由用户决定何时删除。
+状态只保存受管进程恢复所需的 PID、可执行文件、端口、项目路径、无凭据 upstream URL 和 TLS 校验开关；不保存 Web UI token、代理凭据、请求头、目标地址、DNS 名称或 flow payload。capture 在停止后保留，由用户决定何时删除。
 
 ## HTTPS 信任边界
 
@@ -73,6 +75,8 @@ mitmproxy regular proxy 对 HTTPS 使用动态证书，因此设备必须信任�
 HarmonyOS SDK 26 的 CA 专用 `openInstallCertificateDialog` 在手机品类上声明为不支持，因此这里使用官方文件打开流程，而不伪装成第三方 App 可以直接写入系统信任区。系统证书管理器启动后，用户仍必须确认安装；取消、企业策略拒绝或设备不允许用户 CA 都不会被绕过。文件打开流程参考 [HarmonyOS 拉起文件处理类应用](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/file-processing-apps-startup)。
 
 HarmonyOS 网络安全配置可允许应用信任用户 CA，但具体 App 可以关闭用户 CA、实施 certificate pinning，企业策略也可能禁止安装。HarmonyNetBridge 不绕过这些校验。参考：
+
+Mac 到企业 upstream 是另一条独立的 TLS 信任链。若 mitmweb 的 Python 信任库无法识别企业拦截证书，可在开发调试时显式传入 `--ssl-insecure`；该选项只关闭 mitmweb 的上游证书校验，默认不启用，并由 `status` 明确显示。
 
 - [mitmproxy Certificates](https://docs.mitmproxy.org/stable/concepts/certificates/)
 - [mitmproxy Proxy Modes](https://docs.mitmproxy.org/stable/concepts/modes/)

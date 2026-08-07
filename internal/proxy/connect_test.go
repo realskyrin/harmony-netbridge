@@ -73,7 +73,7 @@ func TestConnectDialerRecoversTLSHostnameForIPDestination(t *testing.T) {
 	t.Cleanup(func() { _ = listener.Close() })
 	requestLine := make(chan string, 1)
 	received := make(chan []byte, 1)
-	clientHello := makeTLSClientHello("m.mobilex-static-uat.hsbc.com.hk")
+	clientHello := makeTLSClientHello("assets-uat.example.com")
 	go func() {
 		connection, acceptError := listener.Accept()
 		if acceptError != nil {
@@ -114,7 +114,7 @@ func TestConnectDialerRecoversTLSHostnameForIPDestination(t *testing.T) {
 	if _, err := connection.Write(clientHello[middle:]); err != nil {
 		t.Fatal(err)
 	}
-	if got := <-requestLine; got != "CONNECT m.mobilex-static-uat.hsbc.com.hk:443 HTTP/1.1" {
+	if got := <-requestLine; got != "CONNECT assets-uat.example.com:443 HTTP/1.1" {
 		t.Fatalf("request line = %q", got)
 	}
 	if got := <-received; !bytes.Equal(got, clientHello) {
@@ -332,16 +332,60 @@ func TestNewCapturePathUsesPrivateUniqueName(t *testing.T) {
 	}
 }
 
-func TestManagedArgumentsSetsTCPTimeout(t *testing.T) {
+func TestManagedArgumentsUsesUpstreamMode(t *testing.T) {
 	t.Parallel()
 	arguments := managedArguments(Config{
 		ListenPort:  8080,
 		WebPort:     8081,
 		CaptureFile: "/tmp/capture.mitm",
 		ConfDir:     "/tmp/mitmproxy",
+		UpstreamURL: "http://127.0.0.1:3128",
+		SSLInsecure: true,
 	})
-	if joined := strings.Join(arguments, " "); !strings.Contains(joined, "--set tcp_timeout=90") {
+	joined := strings.Join(arguments, " ")
+	if !strings.Contains(joined, "--mode upstream:http://127.0.0.1:3128") || strings.Contains(joined, "--mode regular") {
+		t.Fatalf("managed arguments = %q", joined)
+	}
+	if !strings.Contains(joined, "--set ssl_insecure=true") {
+		t.Fatalf("managed arguments = %q", joined)
+	}
+	if !strings.Contains(joined, "--set tcp_timeout=90") {
 		t.Fatalf("managed connection lifecycle arguments = %q", joined)
+	}
+}
+
+func TestManagedArgumentsVerifiesUpstreamTLSByDefault(t *testing.T) {
+	t.Parallel()
+	arguments := managedArguments(Config{
+		ListenPort:  8080,
+		WebPort:     8081,
+		CaptureFile: "/tmp/capture.mitm",
+		ConfDir:     "/tmp/mitmproxy",
+		UpstreamURL: "http://127.0.0.1:3128",
+	})
+	if joined := strings.Join(arguments, " "); strings.Contains(joined, "ssl_insecure") {
+		t.Fatalf("managed arguments = %q", joined)
+	}
+}
+
+func TestValidateUpstreamURLRejectsUnsafeValues(t *testing.T) {
+	t.Parallel()
+	for _, upstream := range []string{
+		"ftp://127.0.0.1:3128",
+		"http://user:password@127.0.0.1:3128",
+		"http://127.0.0.1:3128/proxy",
+		"http://127.0.0.1:3128?",
+		"http://127.0.0.1:3128?mode=proxy",
+		"http://127.0.0.1:3128#proxy",
+	} {
+		if err := ValidateUpstreamURL(upstream); err == nil {
+			t.Fatalf("ValidateUpstreamURL accepted %q", upstream)
+		}
+	}
+	for _, upstream := range []string{"", "http://127.0.0.1:3128", "https://proxy.example.com"} {
+		if err := ValidateUpstreamURL(upstream); err != nil {
+			t.Fatalf("ValidateUpstreamURL(%q): %v", upstream, err)
+		}
 	}
 }
 

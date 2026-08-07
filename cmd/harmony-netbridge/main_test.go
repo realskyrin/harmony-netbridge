@@ -50,14 +50,28 @@ func TestParseInvocationAcceptsConfiguredMTU(t *testing.T) {
 func TestParseInvocationAcceptsProxyMode(t *testing.T) {
 	parsed, err := parseInvocation([]string{
 		"proxy", "--mtu", "1280", "--proxy-port", "9080", "--web-port=9081",
-		"--mitmweb", "/opt/homebrew/bin/mitmweb", "--no-open-browser",
+		"--mitmweb", "/opt/homebrew/bin/mitmweb", "--upstream", "http://127.0.0.1:3128",
+		"--ssl-insecure", "--no-open-browser",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !parsed.proxyMode || parsed.proxyPort != 9080 || parsed.webPort != 9081 ||
-		parsed.mitmwebPath != "/opt/homebrew/bin/mitmweb" || !parsed.noOpenBrowser {
+		parsed.mitmwebPath != "/opt/homebrew/bin/mitmweb" ||
+		parsed.upstreamURL != "http://127.0.0.1:3128" || !parsed.sslInsecure || !parsed.noOpenBrowser {
 		t.Fatalf("proxy invocation = %#v", parsed)
+	}
+}
+
+func TestParseInvocationRejectsInvalidUpstream(t *testing.T) {
+	for _, upstream := range []string{
+		"ftp://127.0.0.1:3128",
+		"http://user:password@127.0.0.1:3128",
+		"http://127.0.0.1:3128/proxy",
+	} {
+		if _, err := parseInvocation([]string{"proxy", "--upstream", upstream}); err == nil {
+			t.Fatalf("parseInvocation accepted upstream %q", upstream)
+		}
 	}
 }
 
@@ -105,6 +119,8 @@ func TestParseInvocationRejectsUnknownAndMultipleCommands(t *testing.T) {
 		{"devices"}, {"start", "stop"}, {"start", "--device-port", "0"},
 		{"start", "--mtu", "575"}, {"start", "--mtu", "1501"},
 		{"status", "--mtu", "1280"}, {"start", "--proxy-port", "8080"},
+		{"start", "--upstream", "http://127.0.0.1:3128"},
+		{"start", "--ssl-insecure"},
 		{"proxy", "--proxy-port", "8081", "--web-port", "8081"},
 		{"proxy", "--capture-file", "/tmp/not-public"},
 	} {
@@ -128,14 +144,19 @@ func TestPrintStatusShowsSafeProxyMetadata(t *testing.T) {
 			CACertFile:  "/private/mitmproxy-ca-cert.cer",
 			PID:         1234,
 			Executable:  "/private/mitmweb",
+			UpstreamURL: "http://private-upstream.example.test:3128",
+			SSLInsecure: true,
 		},
 		Relay: state.RelayStats{PacketsFromDevice: 1, ProxyTCPFlows: 2, BlockedQUICFlows: 3},
 	})
 	text := output.String()
-	if !strings.Contains(text, "Proxy:     ACTIVE") || !strings.Contains(text, "Intercept: proxied TCP 2 / QUIC fallbacks 3") {
+	if !strings.Contains(text, "Proxy:     ACTIVE") ||
+		!strings.Contains(text, "TLS verify: DISABLED") ||
+		!strings.Contains(text, "Intercept: proxied TCP 2 / QUIC fallbacks 3") {
 		t.Fatalf("proxy status = %s", text)
 	}
-	if strings.Contains(text, "1234") || strings.Contains(text, "/private/mitmweb") {
+	if strings.Contains(text, "1234") || strings.Contains(text, "/private/mitmweb") ||
+		strings.Contains(text, "private-upstream.example.test") {
 		t.Fatalf("proxy process metadata leaked: %s", text)
 	}
 }

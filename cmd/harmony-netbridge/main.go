@@ -45,6 +45,8 @@ type invocation struct {
 	webPort       int
 	webPortSet    bool
 	mitmwebPath   string
+	upstreamURL   string
+	sslInsecure   bool
 	captureFile   string
 	noOpenBrowser bool
 	help          bool
@@ -110,7 +112,9 @@ func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) 
 			if wantsProxy {
 				proxyChanged := (parsed.proxyPortSet && response.State.Proxy.ListenPort != parsed.proxyPort) ||
 					(parsed.webPortSet && response.State.Proxy.WebPort != parsed.webPort) ||
-					(parsed.noOpenBrowser && response.State.Proxy.OpenBrowser)
+					(parsed.noOpenBrowser && response.State.Proxy.OpenBrowser) ||
+					response.State.Proxy.UpstreamURL != parsed.upstreamURL ||
+					response.State.Proxy.SSLInsecure != parsed.sslInsecure
 				if parsed.mitmwebPath != "" {
 					resolved, discoverError := proxybridge.Discover(parsed.mitmwebPath)
 					if discoverError != nil {
@@ -204,6 +208,12 @@ func startCommand(parsed invocation, paths runtimepath.Paths, output io.Writer) 
 			"--mitmweb", parsed.mitmwebPath,
 			"--capture-file", parsed.captureFile,
 		)
+		if parsed.upstreamURL != "" {
+			childArguments = append(childArguments, "--upstream", parsed.upstreamURL)
+		}
+		if parsed.sslInsecure {
+			childArguments = append(childArguments, "--ssl-insecure")
+		}
 		if parsed.noOpenBrowser {
 			childArguments = append(childArguments, "--no-open-browser")
 		}
@@ -345,6 +355,8 @@ func daemonCommand(parsed invocation, paths runtimepath.Paths) error {
 			CaptureFile: parsed.captureFile,
 			ConfDir:     paths.ProxyConfDir,
 			LogFile:     paths.ProxyLogFile,
+			UpstreamURL: parsed.upstreamURL,
+			SSLInsecure: parsed.sslInsecure,
 		}
 		proxyFactory = func(_ state.ProxySnapshot) (daemon.ProxySession, error) {
 			return proxybridge.Start(proxyConfig)
@@ -412,6 +424,9 @@ func printStatus(output io.Writer, snapshot state.Snapshot) {
 		}
 		if snapshot.Proxy.CACertFile != "" {
 			fmt.Fprintf(output, "HTTPS CA:  App downloads from %s (system confirmation required)\n", snapshot.Proxy.CACertFile)
+		}
+		if snapshot.Proxy.SSLInsecure {
+			fmt.Fprintln(output, "TLS verify: DISABLED for mitmweb upstream connections")
 		}
 	}
 	if snapshot.Daemon == state.DaemonRunning && !snapshot.StartedAt.IsZero() {
@@ -502,10 +517,12 @@ func parseInvocation(arguments []string) (invocation, error) {
 			parsed.version = true
 		case "--proxy-mode":
 			parsed.proxyMode = true
+		case "--ssl-insecure":
+			parsed.sslInsecure = true
 		case "--no-open-browser":
 			parsed.noOpenBrowser = true
 		case "--hdc", "--device", "--device-label", "--device-port", "--mtu",
-			"--proxy-port", "--web-port", "--mitmweb", "--capture-file":
+			"--proxy-port", "--web-port", "--mitmweb", "--upstream", "--capture-file":
 			if index+1 >= len(arguments) {
 				return invocation{}, fmt.Errorf("%s requires a value", argument)
 			}
@@ -517,7 +534,7 @@ func parseInvocation(arguments []string) (invocation, error) {
 			name, value, found := strings.Cut(argument, "=")
 			if found && (name == "--hdc" || name == "--device" || name == "--device-label" ||
 				name == "--device-port" || name == "--mtu" || name == "--proxy-port" ||
-				name == "--web-port" || name == "--mitmweb" || name == "--capture-file") {
+				name == "--web-port" || name == "--mitmweb" || name == "--upstream" || name == "--capture-file") {
 				if err := assignOption(&parsed, name, value); err != nil {
 					return invocation{}, err
 				}
@@ -541,7 +558,8 @@ func parseInvocation(arguments []string) (invocation, error) {
 	if parsed.mtuSet && parsed.command != "start" && parsed.command != "proxy" && parsed.command != "__daemon" {
 		return invocation{}, errors.New("--mtu is only valid with start or proxy")
 	}
-	proxyOptionSet := parsed.proxyPortSet || parsed.webPortSet || parsed.mitmwebPath != "" || parsed.noOpenBrowser
+	proxyOptionSet := parsed.proxyPortSet || parsed.webPortSet || parsed.mitmwebPath != "" ||
+		parsed.upstreamURL != "" || parsed.sslInsecure || parsed.noOpenBrowser
 	if proxyOptionSet && parsed.command != "proxy" && !(parsed.command == "__daemon" && parsed.proxyMode) {
 		return invocation{}, errors.New("proxy options are only valid with proxy")
 	}
@@ -591,6 +609,11 @@ func assignOption(parsed *invocation, name, value string) error {
 		parsed.webPortSet = true
 	case "--mitmweb":
 		parsed.mitmwebPath = value
+	case "--upstream":
+		if err := proxybridge.ValidateUpstreamURL(value); err != nil {
+			return fmt.Errorf("--upstream %w", err)
+		}
+		parsed.upstreamURL = value
 	case "--capture-file":
 		parsed.captureFile = value
 	}
@@ -617,6 +640,8 @@ Options:
   --device <target>  Select one target when multiple devices are Connected
   --mtu <bytes>      VPN MTU in 576...1500 (default 1400)
   --mitmweb <path>   Explicit mitmweb executable (also HARMONY_NETBRIDGE_MITMWEB)
+  --upstream <URL>   Route mitmweb through an HTTP(S) upstream proxy
+  --ssl-insecure     Disable mitmweb upstream TLS certificate verification
   --proxy-port <n>   Loopback proxy port (default 8080)
   --web-port <n>     Loopback mitmweb UI port (default 8081)
   --no-open-browser  Do not let mitmweb open its authenticated Web UI
