@@ -76,6 +76,71 @@ func TestEngineRelaysTCP(t *testing.T) {
 	}
 }
 
+func TestBridgeTCPHalfClosesHostAfterDeviceEOF(t *testing.T) {
+	deviceBridge, devicePeer := net.Pipe()
+	hostBridge, hostPeer := net.Pipe()
+	defer devicePeer.Close()
+	defer hostPeer.Close()
+	writeClosed := make(chan struct{})
+	aborted := make(chan struct{})
+	device := &testHalfCloseConn{Conn: deviceBridge}
+	host := &testHalfCloseConn{
+		Conn:         hostBridge,
+		onCloseWrite: func() { close(writeClosed) },
+		onSetLinger: func(seconds int) {
+			if seconds == 0 {
+				close(aborted)
+			}
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		bridgeTCPWithDrainTimeout(context.Background(), device, host, 20*time.Millisecond)
+		close(done)
+	}()
+
+	if err := devicePeer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-writeClosed:
+	case <-time.After(time.Second):
+		t.Fatal("host write side was not closed after device EOF")
+	}
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("stalled host connection was not aborted after the drain timeout")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("TCP bridge did not close a stalled half-closed flow")
+	}
+}
+
+type testHalfCloseConn struct {
+	net.Conn
+	onCloseWrite func()
+	onSetLinger  func(int)
+}
+
+func (c *testHalfCloseConn) CloseRead() error { return nil }
+
+func (c *testHalfCloseConn) CloseWrite() error {
+	if c.onCloseWrite != nil {
+		c.onCloseWrite()
+	}
+	return nil
+}
+
+func (c *testHalfCloseConn) SetLinger(seconds int) error {
+	if c.onSetLinger != nil {
+		c.onSetLinger(seconds)
+	}
+	return nil
+}
+
 func TestEngineBlocksUDP443InProxyMode(t *testing.T) {
 	t.Parallel()
 	var hostDials atomic.Uint64

@@ -35,6 +35,7 @@ const (
 	defaultPacketQueueSize  = 1024
 	defaultMaxTCPInFlight   = 1024
 	defaultDialTimeout      = 15 * time.Second
+	defaultTCPDrainTimeout  = 5 * time.Second
 	defaultUDPIdleTimeout   = 2 * time.Minute
 	defaultDNSQueryTimeout  = 10 * time.Second
 	maximumIPv4PacketLength = 65_535
@@ -447,7 +448,17 @@ func endpointAddress(address tcpip.Address, port uint16) string {
 	return net.JoinHostPort(address.String(), strconv.Itoa(int(port)))
 }
 
-func bridgeTCP(ctx context.Context, device *gonet.TCPConn, host net.Conn) {
+type halfCloseConnection interface {
+	net.Conn
+	CloseRead() error
+	CloseWrite() error
+}
+
+func bridgeTCP(ctx context.Context, device halfCloseConnection, host net.Conn) {
+	bridgeTCPWithDrainTimeout(ctx, device, host, defaultTCPDrainTimeout)
+}
+
+func bridgeTCPWithDrainTimeout(ctx context.Context, device halfCloseConnection, host net.Conn, drainTimeout time.Duration) {
 	defer device.Close()
 	defer host.Close()
 	stopCloser := make(chan struct{})
@@ -460,25 +471,38 @@ func bridgeTCP(ctx context.Context, device *gonet.TCPConn, host net.Conn) {
 		}
 	}()
 
-	var group sync.WaitGroup
-	group.Add(2)
+	completed := make(chan struct{}, 2)
 	go func() {
-		defer group.Done()
 		_, _ = io.Copy(host, device)
-		if tcpHost, ok := host.(*net.TCPConn); ok {
-			_ = tcpHost.CloseWrite()
+		if closeWriter, ok := host.(interface{ CloseWrite() error }); ok {
+			_ = closeWriter.CloseWrite()
 		}
 		_ = device.CloseRead()
+		completed <- struct{}{}
 	}()
 	go func() {
-		defer group.Done()
 		_, _ = io.Copy(device, host)
 		_ = device.CloseWrite()
-		if tcpHost, ok := host.(*net.TCPConn); ok {
-			_ = tcpHost.CloseRead()
+		if closeReader, ok := host.(interface{ CloseRead() error }); ok {
+			_ = closeReader.CloseRead()
 		}
+		completed <- struct{}{}
 	}()
-	group.Wait()
+	<-completed
+	drainTimer := time.NewTimer(drainTimeout)
+	select {
+	case <-completed:
+		if !drainTimer.Stop() {
+			<-drainTimer.C
+		}
+	case <-drainTimer.C:
+		if lingerSetter, ok := host.(interface{ SetLinger(int) error }); ok {
+			_ = lingerSetter.SetLinger(0)
+		}
+		_ = device.Close()
+		_ = host.Close()
+		<-completed
+	}
 	close(stopCloser)
 }
 

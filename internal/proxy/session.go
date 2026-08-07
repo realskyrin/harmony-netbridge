@@ -24,6 +24,7 @@ const (
 	DefaultWebPort    = 8081
 	readyTimeout      = 10 * time.Second
 	stopTimeout       = 3 * time.Second
+	managedTCPTimeout = 90
 )
 
 // Config defines one project-owned mitmweb process.
@@ -285,6 +286,7 @@ func managedArguments(config Config) []string {
 		"--listen-port", strconv.Itoa(config.ListenPort),
 		"--web-host", "127.0.0.1",
 		"--web-port", strconv.Itoa(config.WebPort),
+		"--set", "tcp_timeout=" + strconv.Itoa(managedTCPTimeout),
 	}
 	if config.OpenBrowser {
 		args = append(args, "--web-open-browser")
