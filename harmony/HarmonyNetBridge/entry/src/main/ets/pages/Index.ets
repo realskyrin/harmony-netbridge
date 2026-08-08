@@ -41,7 +41,8 @@ struct Index {
   @State gateDetail: string = '检查当前设备是否支持 VPN 授权与基础网络接管';
   @State vpnState: string = VpnRuntimeState.snapshot.state;
   @State vpnDetail: string = VpnRuntimeState.snapshot.detail;
-  @State proxyEnabled: boolean = VpnRuntimeState.snapshot.proxyEnabled;
+  @State macProxyEnabled: boolean = bridgeSession.snapshot.proxyEnabled;
+  @State proxyEnabled: boolean = VpnRuntimeState.snapshot.proxyEnabled || bridgeSession.snapshot.proxyEnabled;
   @State diagnosticState: string = 'NOT_RUN';
   @State diagnosticDetail: string = '开启 Tunnel 后可检查 TCP、UDP 与 DNS 连接';
   @State proxyDiagnosticState: string = 'NOT_RUN';
@@ -73,6 +74,10 @@ struct Index {
   aboutToAppear(): void {
     bridgeSession.setListener((snapshot: BridgeSnapshot) => {
       this.connectionState = snapshot.state;
+      this.macProxyEnabled = snapshot.proxyEnabled;
+      if (!this.vpnOwnsUsbBridge()) {
+        this.proxyEnabled = snapshot.proxyEnabled;
+      }
       if (snapshot.state === BridgeConnectionState.CONNECTED && this.showSettings &&
         !this.applicationListLoaded && !this.applicationListLoading) {
         this.loadInstalledApplicationList();
@@ -169,7 +174,7 @@ struct Index {
       return '等待系统确认';
     }
     if (this.connectionState === BridgeConnectionState.CONNECTED) {
-      return 'Mac 服务已就绪';
+      return this.proxyEnabled ? 'Mac 抓包服务已就绪' : 'Mac 服务已就绪';
     }
     return '通过 USB 使用 Mac 网络';
   }
@@ -263,9 +268,9 @@ struct Index {
     const snapshot: VpnRuntimeSnapshot = VpnRuntimeState.snapshot;
     this.vpnState = snapshot.state;
     this.vpnDetail = snapshot.detail;
-    this.proxyEnabled = snapshot.proxyEnabled;
+    this.proxyEnabled = this.vpnOwnsUsbBridge() ? snapshot.proxyEnabled : this.macProxyEnabled;
     if (this.proxyDiagnosticState === 'NOT_RUN') {
-      this.proxyDiagnosticDetail = snapshot.proxyEnabled ?
+      this.proxyDiagnosticDetail = this.proxyEnabled ?
         'mitmweb 已就绪；点击下方按钮验证 HTTP 抓包链路' :
         '在 Mac 运行 proxy 后，可验证 HTTP 流量是否进入 mitmweb';
     }
@@ -1152,6 +1157,9 @@ struct Index {
             .padding({ left: 12, right: 12, top: 10, bottom: 10 })
             .backgroundColor('#172337')
             .borderRadius(12)
+            .onClick(() => {
+              this.requestSetSelectedApp(bundleName, false);
+            })
           }, (bundleName: string) => bundleName)
 
           Button('名单管理')

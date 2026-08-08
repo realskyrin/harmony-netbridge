@@ -32,11 +32,14 @@ export class BridgeSnapshot {
   readonly state: BridgeConnectionState;
   readonly title: string;
   readonly detail: string;
+  readonly proxyEnabled: boolean;
 
-  constructor(state: BridgeConnectionState, title: string, detail: string) {
+  constructor(state: BridgeConnectionState, title: string, detail: string,
+    proxyEnabled: boolean = false) {
     this.state = state;
     this.title = title;
     this.detail = detail;
+    this.proxyEnabled = proxyEnabled;
   }
 }
 
@@ -213,10 +216,12 @@ export class BridgeSession {
         }
         this.currentSessionToken = ack.sessionToken;
         this.reconnectAttempt = 0;
+        const proxyEnabled: boolean = ack.capabilities.indexOf('proxy') >= 0;
         this.publish(new BridgeSnapshot(
           BridgeConnectionState.CONNECTED,
           'Mac 服务已连接',
-          'USB 通信正常，可以开始使用 VPN Tunnel'
+          'USB 通信正常，可以开始使用 VPN Tunnel',
+          proxyEnabled
         ));
         return;
       }

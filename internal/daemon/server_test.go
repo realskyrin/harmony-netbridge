@@ -424,6 +424,68 @@ func TestServerAdvertisesAndClosesManagedProxy(t *testing.T) {
 	}
 }
 
+func TestServerAdvertisesManagedProxyToPhase1Control(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "hnb-proxy-phase1-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths, err := runtimepath.FromRoots(filepath.Join(root, "runtime"), filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 1)}
+	server, err := New(Config{
+		Paths: paths, DeviceID: "secret-device-id", DeviceLabel: "device-redacted", Forwarder: forwarder,
+		ProxyFactory: func(_ state.ProxySnapshot) (ProxySession, error) { return newFakeProxySession(), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(runContext) }()
+	var mapping hdc.Mapping
+	select {
+	case mapping = <-forwarder.added:
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy daemon did not start")
+	}
+	connection, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello, _ := protocol.MarshalJSONPayload(protocol.Hello{
+		Role: "control", Mode: "phase1", AppVersion: "test", SupportedVersions: []int{1},
+		Capabilities: []string{"control"}, Message: "hello",
+	})
+	if err := protocol.WriteFrame(connection, protocol.Frame{Type: protocol.TypeHello, Sequence: 1, Payload: hello}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := protocol.ReadFrame(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acknowledgement protocol.HelloAck
+	if err := protocol.UnmarshalJSONPayload(frame.Payload, &acknowledgement); err != nil {
+		t.Fatal(err)
+	}
+	if !hasCapability(acknowledgement.Capabilities, "proxy") {
+		t.Fatalf("phase1 HELLO_ACK omitted proxy capability: %#v", acknowledgement)
+	}
+	_ = connection.Close()
+	cancel()
+	select {
+	case runError := <-runResult:
+		if runError != nil {
+			t.Fatal(runError)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxy daemon did not stop")
+	}
+}
+
 func TestServerRetainsFailureWhenManagedProxyExits(t *testing.T) {
 	t.Parallel()
 	root, err := os.MkdirTemp("/tmp", "hnb-proxy-failure-")

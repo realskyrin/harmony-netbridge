@@ -815,6 +815,7 @@ func (s *Server) handleControlConnection(connection net.Conn, frame protocol.Fra
 	s.controlMode = hello.Mode
 	s.controlToken = token
 	isReconnect := hello.Mode == "vpn" && s.reconnectPending
+	proxyEnabled := s.proxySession != nil
 	if hello.Mode == "vpn" {
 		s.reconnectPending = false
 	}
@@ -824,11 +825,11 @@ func (s *Server) handleControlConnection(connection net.Conn, frame protocol.Fra
 	defer s.releaseControl(connection)
 
 	capabilities := []string{"control"}
+	if proxyEnabled {
+		capabilities = append(capabilities, "proxy")
+	}
 	if hello.Mode == "vpn" {
 		capabilities = append(capabilities, "data", "tcp", "udp", "dns", "heartbeat", "reconnect", "mtu")
-		if s.proxySession != nil {
-			capabilities = append(capabilities, "proxy")
-		}
 	}
 	payload, err := protocol.MarshalJSONPayload(protocol.HelloAck{
 		SelectedVersion: protocol.CurrentVersion,
