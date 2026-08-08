@@ -4,15 +4,28 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN: number = 0x484E;
 const TAG: string = 'HNBProxyDiag';
-const MITM_INSTALL_URL: string = 'http://mitm.it/';
 const TIMEOUT_MS: number = 5000;
 
-export function isMitmInstallPage(responseCode: number, body: string): boolean {
-  if (responseCode !== 200 || body.length === 0) {
-    return false;
-  }
-  const normalized: string = body.toLowerCase();
-  return normalized.indexOf('mitmproxy') >= 0 || normalized.indexOf('certificate') >= 0;
+export interface ProxyDiagnosticTarget {
+  name: string;
+  url: string;
+}
+
+const GOOGLE_TARGET: ProxyDiagnosticTarget = {
+  name: 'Google',
+  url: 'http://www.google.com/generate_204'
+};
+const BAIDU_TARGET: ProxyDiagnosticTarget = {
+  name: '百度',
+  url: 'http://www.baidu.com/'
+};
+
+export function selectProxyDiagnosticTarget(randomValue: number): ProxyDiagnosticTarget {
+  return randomValue < 0.5 ? GOOGLE_TARGET : BAIDU_TARGET;
+}
+
+export function isSuccessfulProxyProbeResponse(responseCode: number): boolean {
+  return responseCode >= 200 && responseCode < 400;
 }
 
 // This HTTP-only probe is intentionally safe before CA installation. A pass
@@ -20,9 +33,10 @@ export function isMitmInstallPage(responseCode: number, body: string): boolean {
 // and mitmweb. HTTPS decryption remains a separate, explicit trust action.
 export class ProxyDiagnostics {
   async run(): Promise<string> {
+    const target: ProxyDiagnosticTarget = selectProxyDiagnosticTarget(Math.random());
     const request: http.HttpRequest = http.createHttp();
     try {
-      const response: http.HttpResponse = await request.request(MITM_INSTALL_URL, {
+      const response: http.HttpResponse = await request.request(target.url, {
         method: http.RequestMethod.GET,
         expectDataType: http.HttpDataType.STRING,
         usingCache: false,
@@ -30,13 +44,12 @@ export class ProxyDiagnostics {
         readTimeout: TIMEOUT_MS,
         addressFamily: http.AddressFamily.ONLY_V4
       });
-      const body: string = response.result as string;
       const responseCode: number = response.responseCode as number;
-      if (!isMitmInstallPage(responseCode, body)) {
-        throw new Error(`mitm.it 返回非预期响应：${responseCode}`);
+      if (!isSuccessfulProxyProbeResponse(responseCode)) {
+        throw new Error(`${target.name} 返回非预期响应：${responseCode}`);
       }
       hilog.info(DOMAIN, TAG, 'PHASE4_PROXY_HTTP_PASS');
-      return 'HTTP 抓包链路已验证；HTTPS 解密仍需手动安装 mitmproxy CA';
+      return `HTTP 抓包链路已通过 ${target.name} 验证；HTTPS 解密仍需手动安装 mitmproxy CA`;
     } catch (error) {
       const businessError: BusinessError = error as BusinessError;
       const detail: string = businessError.code === undefined ? businessError.message : businessError.code.toString();

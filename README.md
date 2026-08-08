@@ -15,6 +15,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
 - HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
 - App 设置页通过 Tab 切换白名单或黑名单模式，APP 分流卡片只展示已选 APP；点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表。HarmonyNetBridge 自身不显示在名单中并始终进入 Tunnel。两种模式共用同一份选中结果：白名单把本应用和选中 Bundle 写入 `VpnConfig.trustedApplications`，黑名单把选中 Bundle 写入 `blockedApplications`，且始终排除本应用。
+- App 会以 0.5/1/2/4 秒上限退避探测 Mac 服务；先打开 App、随后启动 Mac Bridge，或重新插入数据线后，首页连接状态都会自动更新。VPN Tunnel 接管期间不会抢占连接。
 - `start --mtu 576...1500`：由 Mac 在握手中下发 MTU，设备 VPN 与 gVisor relay 使用同一值，默认 1400。
 - Native C++ `PacketPump` 独占 TUN fd 与 Data socket，支持双向 raw IPv4 packet。
 - Control 与 Data 各自每 5 秒发送 HNB 心跳；连续 15 秒未收到对应响应即关闭失效会话，避免保留黑洞默认路由。
@@ -24,7 +25,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - Mac gVisor relay 支持 TCP、UDP 和 DNS-over-UDP / DNS-over-TCP。
 - DNS 虚拟地址 `198.18.0.1`；Mac 端读取 `scutil --dns`，按最长域名后缀选择企业 split-DNS resolver。resolver 失败时立即刷新配置，UDP 截断响应自动改用 TCP，不静默回退公共 DNS。
 - `status` 展示 MTU、运行时长、双通道 RTT、重连次数以及包/字节/流聚合值；不展示地址、端口、packet payload 或 session token。
-- App 内置 VPN 网络自检、`mitm.it` HTTP 抓包自检，以及不依赖外部证书站点的 Mac CA 下载入口。
+- App 内置 VPN 网络自检、Google/百度随机 HTTP 抓包自检，以及不依赖外部证书站点的 Mac CA 下载入口。
 - Gate V 探针仍保留，便于在新设备上单独验证 VPN 授权、`protect()`、TUN read 与销毁。
 
 协议细节见 [HNB/1](docs/protocol.md)，Phase 4 实现与验收见 [Phase 4 文档](docs/phase-4.md)，稳定性基线见 [Phase 3 文档](docs/phase-3.md)，原始能力分析见 [技术方案设计文档](docs/spark/2026-08-06-harmony-netbridge-design.md)。
@@ -143,7 +144,7 @@ HarmonyOS App：
 
 ### APP 白名单与黑名单分流
 
-- APP 分流卡片始终只展示已选 APP，不在设置页平铺完整安装列表；点击“名单管理”后，二级 Bottom Sheet 才展示搜索、刷新和完整已安装 APP 列表，其中已选 APP 自动排在未选 APP 前面。HarmonyNetBridge 自身会从已安装列表和历史选中结果中移除，并作为隐式规则始终进入 Tunnel。白名单与黑名单 Tab 共用同一份选中结果，切换模式不会复制、清空或替换已选 APP。
+- APP 分流卡片始终只展示已选 APP，不在设置页平铺完整安装列表；点击“名单管理”后，二级 Bottom Sheet 才展示搜索和完整已安装 APP 列表，列表支持下拉刷新，已选 APP 自动排在未选 APP 前面。HarmonyNetBridge 自身会从已安装列表和历史选中结果中移除，并作为隐式规则始终进入 Tunnel。白名单与黑名单 Tab 共用同一份选中结果，切换模式不会复制、清空或替换已选 APP。
 - daemon 优先执行只读 `hdc shell bm dump -a -l` 获取本地化 APP 名称和 Bundle 名称；设备版本不支持标签输出时回退到 `bm dump -a`。列表请求必须携带当前控制会话的随机 token，连接断开后立即失效。
 - 白名单模式让本应用和选中 APP 进入 Tunnel，对应 Bundle 写入 `VpnConfig.trustedApplications`；黑名单模式让选中 APP 保持直连，其余 APP 进入 Tunnel，对应 Bundle 写入 `blockedApplications`，本应用不会被写入黑名单。两种模式不会同时下发非空列表。
 - 白名单为空时仍可创建 Tunnel，但只接管作为隐式白名单成员的 HarmonyNetBridge；黑名单为空表示不排除任何 APP，因此所有 APP 都会进入 Tunnel。
@@ -215,7 +216,7 @@ capture、日志与 CA 文件使用 `0600`，所属目录使用 `0700`。停止�
 - HTTP CONNECT 适配、非 2xx/超长响应拒绝、buffered tunnel 数据保留、代理 flow 统计与 UDP/443 回退。
 - mitmweb upstream 参数、TLS 校验开关、受管生命周期、私有 capture/CA 权限、两个只读 CA 下载端点和精确 orphan 识别。
 - macOS resolver 失效刷新与 UDP DNS 截断后的 TCP 重试。
-- ArkTS 协议、MTU、重连退避、DNS TCP 分片、已安装 APP 列表解码/搜索、CA 下载响应边界与 `mitm.it` 响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
+- ArkTS 协议、MTU、重连退避、DNS TCP 分片、已安装 APP 列表解码/搜索、CA 下载响应边界、随机 HTTP 检测目标与响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
 
 这些检查不能替代真机证据。2026-08-06 已在单台物理设备完成 Phase 3 的 MTU、双向流量、心跳和故障恢复验收；Phase 4 的当前真机与 mitmweb 证据见 [Phase 4 文档](docs/phase-4.md)。跨小时、休眠唤醒和吞吐基准仍未执行。
 

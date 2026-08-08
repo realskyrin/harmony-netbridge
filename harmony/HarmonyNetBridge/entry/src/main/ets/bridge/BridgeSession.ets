@@ -12,6 +12,10 @@ import {
   HnbFrameType,
   StopRequestPayload
 } from './HnbProtocol';
+import {
+  bridgeReconnectDelay,
+  shouldScheduleBridgeReconnect
+} from './BridgeReconnectPolicy';
 
 const BRIDGE_ADDRESS: string = '127.0.0.1';
 const BRIDGE_PORT: number = 27183;
@@ -52,6 +56,9 @@ export class BridgeSession {
   private manualClosing: boolean = false;
   private nextOutgoingSequence: number = 1;
   private currentSessionToken: string = '';
+  private autoReconnectEnabled: boolean = false;
+  private reconnectAttempt: number = 0;
+  private reconnectTimer: number = -1;
 
   get snapshot(): BridgeSnapshot {
     return this.current;
@@ -68,10 +75,25 @@ export class BridgeSession {
     }
   }
 
+  resumeAutoReconnect(): void {
+    if (!this.autoReconnectEnabled) {
+      this.autoReconnectEnabled = true;
+      this.reconnectAttempt = 0;
+    }
+    this.scheduleReconnect(true);
+  }
+
+  pauseAutoReconnect(): void {
+    this.autoReconnectEnabled = false;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
+  }
+
   async connect(): Promise<void> {
     if (this.client !== undefined || this.current.state === BridgeConnectionState.CONNECTING) {
       return;
     }
+    this.clearReconnectTimer();
     this.manualClosing = false;
     this.decoder.reset();
     this.nextOutgoingSequence = 1;
@@ -122,15 +144,15 @@ export class BridgeSession {
         capabilities: ['control'],
         message: 'hello'
       };
+      this.publish(new BridgeSnapshot(
+        BridgeConnectionState.CONNECTING,
+        '已连接，等待 world',
+        '正在通过 USB 控制通道发送 HELLO'
+      ));
       await this.send(client, HnbFrameType.HELLO, encodeJsonPayload(hello));
       if (this.client !== client || this.manualClosing) {
         return;
       }
-      this.publish(new BridgeSnapshot(
-        BridgeConnectionState.CONNECTING,
-        '已连接，等待 world',
-        'HELLO 已通过 USB 控制通道发送'
-      ));
     } catch (error) {
       if (this.client !== client) {
         return;
@@ -142,11 +164,13 @@ export class BridgeSession {
         this.safeBusinessError(businessError)
       ));
       await this.closeClient(client);
+      this.scheduleReconnect();
     }
   }
 
   async disconnect(): Promise<void> {
     this.manualClosing = true;
+    this.clearReconnectTimer();
     const client: socket.TCPSocket | undefined = this.client;
     if (client !== undefined) {
       await this.closeClient(client);
@@ -175,6 +199,7 @@ export class BridgeSession {
         protocolError.message
       ));
       await this.closeClient(client);
+      this.scheduleReconnect();
     }
   }
 
@@ -187,9 +212,10 @@ export class BridgeSession {
           throw new Error('Mac returned an invalid HELLO_ACK');
         }
         this.currentSessionToken = ack.sessionToken;
+        this.reconnectAttempt = 0;
         this.publish(new BridgeSnapshot(
           BridgeConnectionState.CONNECTED,
-          'Mac 控制通道已连接',
+          'Mac 服务已连接',
           'USB 通信正常，可以开始使用 VPN Tunnel'
         ));
         return;
@@ -204,6 +230,7 @@ export class BridgeSession {
           request.reason
         ));
         await this.closeClient(client);
+        this.scheduleReconnect();
         return;
       }
       case HnbFrameType.ERROR: {
@@ -214,6 +241,7 @@ export class BridgeSession {
           errorPayload.message
         ));
         await this.closeClient(client);
+        this.scheduleReconnect();
         return;
       }
       default:
@@ -257,16 +285,18 @@ export class BridgeSession {
       return;
     }
     this.client = undefined;
+    this.currentSessionToken = '';
     if (!this.manualClosing) {
       this.publish(new BridgeSnapshot(
         BridgeConnectionState.DISCONNECTED,
         'Mac 连接已断开',
-        '请检查 USB 与 Mac 服务，然后手动重新连接'
+        '请检查 USB 与 Mac 服务，连接将在后台自动重试'
       ));
+      this.scheduleReconnect();
     }
   }
 
-  private onSocketError(client: socket.TCPSocket, error: BusinessError): void {
+  private async onSocketError(client: socket.TCPSocket, error: BusinessError): Promise<void> {
     if (this.client !== client || this.manualClosing) {
       return;
     }
@@ -275,7 +305,31 @@ export class BridgeSession {
       'Socket 错误',
       this.safeBusinessError(error)
     ));
-    this.closeClient(client);
+    await this.closeClient(client);
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(immediate: boolean = false): void {
+    if (this.reconnectTimer >= 0 || !shouldScheduleBridgeReconnect(
+      this.autoReconnectEnabled, this.client !== undefined, this.current.state)) {
+      return;
+    }
+    let delay: number = 0;
+    if (!immediate) {
+      this.reconnectAttempt++;
+      delay = bridgeReconnectDelay(this.reconnectAttempt);
+    }
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = -1;
+      this.connect();
+    }, delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer >= 0) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = -1;
+    }
   }
 
   private publish(snapshot: BridgeSnapshot): void {
@@ -286,8 +340,8 @@ export class BridgeSession {
   }
 
   private safeBusinessError(error: BusinessError): string {
-    return error.code === undefined ? '无法建立 USB 连接，请检查 Mac 服务' :
-      `无法建立 USB 连接，请检查 Mac 服务（错误 ${error.code}）`;
+    return error.code === undefined ? '无法建立 USB 连接；请检查 Mac 服务，App 将自动重试' :
+      `无法建立 USB 连接；请检查 Mac 服务，App 将自动重试（错误 ${error.code}）`;
   }
 }
 

@@ -37,8 +37,6 @@ const DEVELOPER_OPTIONS_URI: string = 'developer_options_settings';
 @Component
 struct Index {
   @State connectionState: BridgeConnectionState = bridgeSession.snapshot.state;
-  @State statusTitle: string = bridgeSession.snapshot.title;
-  @State statusDetail: string = bridgeSession.snapshot.detail;
   @State gateStatus: string = 'NOT_RUN';
   @State gateDetail: string = '检查当前设备是否支持 VPN 授权与基础网络接管';
   @State vpnState: string = VpnRuntimeState.snapshot.state;
@@ -61,6 +59,7 @@ struct Index {
   @State applicationSearch: string = '';
   @State applicationListLoaded: boolean = false;
   @State applicationListLoading: boolean = false;
+  @State applicationListRefreshing: boolean = false;
   @State applicationListError: string = '';
   @State showAppPicker: boolean = false;
   @State showSettings: boolean = false;
@@ -74,19 +73,20 @@ struct Index {
   aboutToAppear(): void {
     bridgeSession.setListener((snapshot: BridgeSnapshot) => {
       this.connectionState = snapshot.state;
-      this.statusTitle = snapshot.title;
-      this.statusDetail = snapshot.detail;
       if (snapshot.state === BridgeConnectionState.CONNECTED && this.showSettings &&
         !this.applicationListLoaded && !this.applicationListLoading) {
         this.loadInstalledApplicationList();
       } else if ((snapshot.state === BridgeConnectionState.ERROR ||
         snapshot.state === BridgeConnectionState.DISCONNECTED) && this.showSettings &&
         !this.applicationListLoaded) {
-        this.applicationListError = '无法读取已安装 APP：Mac 控制通道未连接';
+        this.applicationListError = '无法读取已安装 APP：Mac 尚未连接';
       }
     });
     this.subscribeVpnStatus();
     this.refreshVpnStatus();
+    if (!this.vpnOwnsUsbBridge()) {
+      bridgeSession.resumeAutoReconnect();
+    }
     this.refreshCertificateStatus();
     this.loadAppRouting();
     this.vpnStatusTimer = setInterval(() => {
@@ -203,18 +203,11 @@ struct Index {
     return '请先在 Mac 启动 HarmonyNetBridge 服务，然后开启 VPN Tunnel';
   }
 
-  private requestConnect(): void {
-    bridgeSession.connect();
-  }
-
-  private requestDisconnect(): void {
-    bridgeSession.disconnect();
-  }
-
   private async requestGateV(): Promise<void> {
     this.gateStatus = 'STARTING';
-    this.gateDetail = '正在关闭控制通道并请求系统 VPN 授权';
+    this.gateDetail = '正在准备兼容性检测并请求系统 VPN 授权';
     try {
+      bridgeSession.pauseAutoReconnect();
       await bridgeSession.disconnect();
       await vpnExtension.startVpnExtensionAbility({
         bundleName: BUNDLE_NAME,
@@ -227,6 +220,7 @@ struct Index {
       const businessError: BusinessError = error as BusinessError;
       this.gateStatus = 'ERROR';
       this.gateDetail = `兼容性检测启动失败：${businessError.code}`;
+      bridgeSession.resumeAutoReconnect();
     }
   }
 
@@ -240,6 +234,7 @@ struct Index {
     VpnRuntimeState.publish('STARTING', '正在准备 USB 网络通道', false);
     this.refreshVpnStatus();
     try {
+      bridgeSession.pauseAutoReconnect();
       await bridgeSession.disconnect();
       await vpnExtension.startVpnExtensionAbility({
         bundleName: BUNDLE_NAME,
@@ -264,6 +259,7 @@ struct Index {
   }
 
   private refreshVpnStatus(): void {
+    const bridgeWasOwnedByVpn: boolean = this.vpnOwnsUsbBridge();
     const snapshot: VpnRuntimeSnapshot = VpnRuntimeState.snapshot;
     this.vpnState = snapshot.state;
     this.vpnDetail = snapshot.detail;
@@ -272,6 +268,11 @@ struct Index {
       this.proxyDiagnosticDetail = snapshot.proxyEnabled ?
         'mitmweb 已就绪；点击下方按钮验证 HTTP 抓包链路' :
         '在 Mac 运行 proxy 后，可验证 HTTP 流量是否进入 mitmweb';
+    }
+    if (this.vpnOwnsUsbBridge()) {
+      bridgeSession.pauseAutoReconnect();
+    } else if (bridgeWasOwnedByVpn) {
+      bridgeSession.resumeAutoReconnect();
     }
   }
 
@@ -317,7 +318,7 @@ struct Index {
       return;
     }
     this.proxyDiagnosticState = 'RUNNING';
-    this.proxyDiagnosticDetail = '正在请求 http://mitm.it，验证 TUN → USB → mitmweb';
+    this.proxyDiagnosticDetail = '正在随机请求 Google 或百度，验证 TUN → USB → mitmweb';
     try {
       this.proxyDiagnosticDetail = await new ProxyDiagnostics().run();
       this.proxyDiagnosticState = 'PASS';
@@ -453,23 +454,6 @@ struct Index {
     return this.appRoutingLoaded && !this.appRoutingSaving && !this.vpnSwitchOn() && this.vpnState !== 'STOPPING';
   }
 
-  private appRoutingStatusLabel(): string {
-    if (!this.appRoutingLoaded) {
-      return '加载中';
-    }
-    if (this.appRoutingSaving) {
-      return '保存中';
-    }
-    return `${this.appRoutingModeLabel()} · ${this.selectedApplications.length} 个`;
-  }
-
-  private appRoutingStatusColor(): string {
-    if (!this.appRoutingLoaded || this.appRoutingSaving) {
-      return '#38BDF8';
-    }
-    return canStartAppRouting(this.appRoutingMode, this.selectedApplications) ? '#22C55E' : '#FBBF24';
-  }
-
   private appRoutingModeLabel(): string {
     return this.appRoutingMode === AppRoutingMode.BLACKLIST ? '黑名单' : '白名单';
   }
@@ -596,6 +580,14 @@ struct Index {
       }
     } finally {
       this.applicationListLoading = false;
+    }
+  }
+
+  private async refreshInstalledApplicationList(): Promise<void> {
+    try {
+      await this.loadInstalledApplicationList();
+    } finally {
+      this.applicationListRefreshing = false;
     }
   }
 
@@ -1067,7 +1059,11 @@ struct Index {
           .margin({ top: 6 })
 
         Column({ space: 12 }) {
-          this.CardHeader('APP 分流', this.appRoutingStatusLabel(), this.appRoutingStatusColor())
+          Text('APP 分流')
+            .fontSize(17)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#F8FAFC')
+            .width('100%')
 
           Row({ space: 4 }) {
             Button('白名单')
@@ -1127,17 +1123,12 @@ struct Index {
 
           ForEach(this.selectedApplications, (bundleName: string) => {
             Row({ space: 12 }) {
-              Row() {
-                Text('✓')
-                  .fontSize(13)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor('#7DD3FC')
-              }
+              Checkbox({ name: bundleName, group: 'vpn_app_routing_summary' })
+                .select(true)
+                .selectedColor('#2563EB')
                 .width(28)
                 .height(28)
-                .justifyContent(FlexAlign.Center)
-                .backgroundColor('#163A57')
-                .borderRadius(14)
+                .hitTestBehavior(HitTestMode.None)
 
               Column({ space: 3 }) {
                 Text(this.selectedApplicationDisplayName(bundleName))
@@ -1197,46 +1188,23 @@ struct Index {
           .margin({ top: 6 })
 
         Column({ space: 12 }) {
-          this.CardHeader('Mac 控制通道', this.displayedConnectionState(), this.statusColor())
-          Text(this.vpnOwnsUsbBridge() ?
-            'VPN Tunnel 正在管理 USB 连接，关闭 Tunnel 后可单独测试控制通道。' : this.statusDetail)
-            .fontSize(14)
-            .fontColor('#B8C6D9')
-            .lineHeight(21)
-            .width('100%')
-          if (!this.vpnOwnsUsbBridge()) {
-            Row({ space: 12 }) {
-              Button('连接 Mac')
-                .enabled(this.connectionState !== BridgeConnectionState.CONNECTING &&
-                  this.connectionState !== BridgeConnectionState.CONNECTED)
-                .backgroundColor('#2563EB')
-                .fontColor('#FFFFFF')
-                .layoutWeight(1)
-                .onClick(() => {
-                  this.requestConnect();
-                })
-              Button('断开连接')
-                .enabled(this.connectionState === BridgeConnectionState.CONNECTED ||
-                  this.connectionState === BridgeConnectionState.CONNECTING)
-                .backgroundColor('#26364D')
-                .fontColor('#F8FAFC')
-                .layoutWeight(1)
-                .onClick(() => {
-                  this.requestDisconnect();
-                })
-            }
-            .width('100%')
+          Row({ space: 12 }) {
+            Text('抓包链路')
+              .fontSize(17)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#F8FAFC')
+              .layoutWeight(1)
+            Text(this.proxyEnabled ?
+              this.diagnosticStateLabel(this.proxyDiagnosticState) : '未启用')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.proxyEnabled ?
+                this.diagnosticStateColor(this.proxyDiagnosticState) : '#94A3B8')
+              .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+              .backgroundColor('#19263A')
+              .borderRadius(12)
           }
-        }
-        .width('100%')
-        .padding(18)
-        .backgroundColor('#111C2E')
-        .borderRadius(18)
-
-        Column({ space: 12 }) {
-          this.CardHeader('抓包链路', this.proxyEnabled ?
-            this.diagnosticStateLabel(this.proxyDiagnosticState) : '未启用',
-            this.proxyEnabled ? this.diagnosticStateColor(this.proxyDiagnosticState) : '#94A3B8')
+          .width('100%')
           Text(this.proxyEnabled ?
             this.proxyDiagnosticDetail :
             'Mac 当前为标准转发模式。运行 harmony-netbridge proxy 后重新开启 Tunnel，即可使用抓包功能。')
@@ -1259,8 +1227,11 @@ struct Index {
         .borderRadius(18)
 
         Column({ space: 12 }) {
-          this.CardHeader('网络连接检测', this.diagnosticStateLabel(this.diagnosticState),
-            this.diagnosticStateColor(this.diagnosticState))
+          Text('网络连接检测')
+            .fontSize(17)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#F8FAFC')
+            .width('100%')
           Text(this.diagnosticDetail)
             .fontSize(14)
             .fontColor('#B8C6D9')
@@ -1413,29 +1384,17 @@ struct Index {
         .fontColor('#B8C6D9')
         .width('100%')
 
-      Row({ space: 10 }) {
-        TextInput({ placeholder: '搜索 APP 名称或 Bundle 名称', text: this.applicationSearch })
-          .height(44)
-          .fontSize(13)
-          .fontColor('#F8FAFC')
-          .placeholderColor('#64748B')
-          .backgroundColor('#172337')
-          .layoutWeight(1)
-          .onChange((value: string) => {
-            this.applicationSearch = value;
-            this.scrollAppPickerToTop();
-          })
-        Button(this.applicationListLoading ? '读取中' : '刷新')
-          .enabled(!this.applicationListLoading)
-          .height(44)
-          .fontSize(13)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#26364D')
-          .onClick(() => {
-            this.loadInstalledApplicationList();
-          })
-      }
-      .width('100%')
+      TextInput({ placeholder: '搜索 APP 名称或 Bundle 名称', text: this.applicationSearch })
+        .height(44)
+        .fontSize(13)
+        .fontColor('#F8FAFC')
+        .placeholderColor('#64748B')
+        .backgroundColor('#172337')
+        .width('100%')
+        .onChange((value: string) => {
+          this.applicationSearch = value;
+          this.scrollAppPickerToTop();
+        })
 
       if (this.applicationListLoading && this.installedApplications.length === 0) {
         Text('正在通过 USB 读取设备上的已安装 APP…')
@@ -1459,98 +1418,107 @@ struct Index {
           .width('100%')
       }
 
-      Scroll(this.appPickerScroller) {
-        Column({ space: 8 }) {
-          ForEach(this.visibleInstalledApplications(), (application: InstalledApplication) => {
-            Row({ space: 12 }) {
-              Checkbox({ name: application.bundleName, group: 'vpn_app_routing_selection' })
-                .select(this.selectedApplications.indexOf(application.bundleName) >= 0)
-                .enabled(this.appRoutingEditable())
-                .selectedColor('#2563EB')
-                .width(28)
-                .height(28)
-                .onChange((selected: boolean) => {
-                  this.requestSetSelectedApp(application.bundleName, selected);
-                })
+      Refresh({ refreshing: $$this.applicationListRefreshing }) {
+        Scroll(this.appPickerScroller) {
+          Column({ space: 8 }) {
+            ForEach(this.visibleInstalledApplications(), (application: InstalledApplication) => {
+              Row({ space: 12 }) {
+                Checkbox({ name: application.bundleName, group: 'vpn_app_routing_selection' })
+                  .select(this.selectedApplications.indexOf(application.bundleName) >= 0)
+                  .enabled(this.appRoutingEditable())
+                  .selectedColor('#2563EB')
+                  .width(28)
+                  .height(28)
+                  .onChange((selected: boolean) => {
+                    this.requestSetSelectedApp(application.bundleName, selected);
+                  })
 
-              Column({ space: 3 }) {
-                Text(applicationDisplayName(application))
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor('#E2E8F0')
-                  .maxLines(1)
-                  .width('100%')
-                Text(application.bundleName)
-                  .fontSize(11)
-                  .fontColor('#71839C')
-                  .maxLines(2)
-                  .width('100%')
+                Column({ space: 3 }) {
+                  Text(applicationDisplayName(application))
+                    .fontSize(14)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor('#E2E8F0')
+                    .maxLines(1)
+                    .width('100%')
+                  Text(application.bundleName)
+                    .fontSize(11)
+                    .fontColor('#71839C')
+                    .maxLines(2)
+                    .width('100%')
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
               }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
+              .width('100%')
+              .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+              .backgroundColor('#172337')
+              .borderRadius(12)
+            }, (application: InstalledApplication) => application.bundleName)
+
+            if (this.applicationListLoaded && this.visibleInstalledApplications().length === 0) {
+              Text('没有匹配的 APP')
+                .fontSize(13)
+                .fontColor('#94A3B8')
+                .width('100%')
+                .padding({ top: 20, bottom: 20 })
+                .textAlign(TextAlign.Center)
             }
-            .width('100%')
-            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-            .backgroundColor('#172337')
-            .borderRadius(12)
-          }, (application: InstalledApplication) => application.bundleName)
 
-          if (this.applicationListLoaded && this.visibleInstalledApplications().length === 0) {
-            Text('没有匹配的 APP')
-              .fontSize(13)
-              .fontColor('#94A3B8')
-              .width('100%')
-              .padding({ top: 20, bottom: 20 })
-              .textAlign(TextAlign.Center)
-          }
-
-          if (this.unavailableSelectedApplications().length > 0) {
-            Text('已选但当前不可用')
-              .fontSize(12)
-              .fontWeight(FontWeight.Medium)
-              .fontColor('#FBBF24')
-              .width('100%')
-              .margin({ top: 6 })
-          }
-
-          ForEach(this.unavailableSelectedApplications(), (bundleName: string) => {
-            Row({ space: 12 }) {
-              Column({ space: 3 }) {
-                Text(bundleName)
-                  .fontSize(13)
-                  .fontColor('#CBD5E1')
-                  .maxLines(2)
-                  .width('100%')
-                Text('当前安装列表中已不可用')
-                  .fontSize(11)
-                  .fontColor('#FBBF24')
-                  .width('100%')
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              Button('移除')
-                .enabled(this.appRoutingEditable())
-                .height(34)
+            if (this.unavailableSelectedApplications().length > 0) {
+              Text('已选但当前不可用')
                 .fontSize(12)
-                .fontColor('#FCA5A5')
-                .backgroundColor('#3A2028')
-                .onClick(() => {
-                  this.requestSetSelectedApp(bundleName, false);
-                })
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#FBBF24')
+                .width('100%')
+                .margin({ top: 6 })
             }
-            .width('100%')
-            .padding({ left: 12, right: 8, top: 9, bottom: 9 })
-            .backgroundColor('#172337')
-            .borderRadius(12)
-          }, (bundleName: string) => bundleName)
+
+            ForEach(this.unavailableSelectedApplications(), (bundleName: string) => {
+              Row({ space: 12 }) {
+                Column({ space: 3 }) {
+                  Text(bundleName)
+                    .fontSize(13)
+                    .fontColor('#CBD5E1')
+                    .maxLines(2)
+                    .width('100%')
+                  Text('当前安装列表中已不可用')
+                    .fontSize(11)
+                    .fontColor('#FBBF24')
+                    .width('100%')
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
+                Button('移除')
+                  .enabled(this.appRoutingEditable())
+                  .height(34)
+                  .fontSize(12)
+                  .fontColor('#FCA5A5')
+                  .backgroundColor('#3A2028')
+                  .onClick(() => {
+                    this.requestSetSelectedApp(bundleName, false);
+                  })
+              }
+              .width('100%')
+              .padding({ left: 12, right: 8, top: 9, bottom: 9 })
+              .backgroundColor('#172337')
+              .borderRadius(12)
+            }, (bundleName: string) => bundleName)
+          }
+          .width('100%')
         }
         .width('100%')
+        .height('100%')
+        .align(Alignment.TopStart)
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
       }
       .width('100%')
       .layoutWeight(1)
       .align(Alignment.TopStart)
-      .scrollBar(BarState.Off)
-      .edgeEffect(EdgeEffect.Spring)
+      .pullToRefresh(true)
+      .onRefreshing(() => {
+        this.refreshInstalledApplicationList();
+      })
     }
     .width('100%')
     .height('100%')

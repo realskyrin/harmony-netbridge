@@ -107,7 +107,7 @@ export function prioritizeSelectedApplications(applications: InstalledApplicatio
 export class InstalledApplicationSource {
   async load(sessionToken: string): Promise<InstalledApplication[]> {
     if (!/^[0-9a-f]{32}$/.test(sessionToken)) {
-      throw new Error('请先连接 Mac 控制通道');
+      throw new Error('Mac 尚未连接，请稍后重试');
     }
     const request: http.HttpRequest = http.createHttp();
     try {

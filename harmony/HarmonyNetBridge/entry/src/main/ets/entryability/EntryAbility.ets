@@ -17,12 +17,12 @@ export default class EntryAbility extends UIAbility {
         hilog.error(DOMAIN, TAG, 'Failed to load Index. code=%{public}d', error.code);
         return;
       }
-      hilog.info(DOMAIN, TAG, 'Index loaded; starting Phase 1 control session');
-      bridgeSession.connect();
+      hilog.info(DOMAIN, TAG, 'Index loaded; the Mac control session is ready');
     });
   }
 
   onDestroy(): void {
+    bridgeSession.pauseAutoReconnect();
     bridgeSession.disconnect();
     hilog.info(DOMAIN, TAG, 'EntryAbility destroyed');
   }
