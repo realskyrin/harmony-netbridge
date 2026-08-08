@@ -4,7 +4,7 @@
 
 Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修改手机全局代理，也不改变 HNB/1 帧格式。
 
-当前 App 在这一数据面前增加了按 App 白名单/黑名单分流：设置页主卡片只展示已选 APP，点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表，已选 APP 会自动排在未选 APP 前面，两种模式共用同一份选中结果。HarmonyNetBridge 自身从名单中隐藏并始终进入 TUN：白名单把本应用和选中 Bundle 写入 `VpnConfig.trustedApplications`；黑名单把选中 Bundle 写入 `blockedApplications`，并强制从中排除本应用。空白名单只接管本应用，空黑名单接管全部 App。
+当前 App 在这一数据面前增加了按 App 白名单/黑名单分流：设置页主卡片只展示已选 APP，点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表，已选 APP 会自动排在未选 APP 前面，两种模式共用同一份选中结果。HarmonyNetBridge 自身从名单中隐藏并始终进入 TUN：白名单只下发包含本应用和选中 Bundle 的 `VpnConfig.trustedApplications`；黑名单只下发包含选中 Bundle 的 `blockedApplications`，并强制从中排除本应用。未使用的可选名单字段不会以空数组下发，避免设备错误选择名单策略。空白名单只接管本应用，空黑名单省略两个名单字段并接管全部 App。
 
 已实现：
 
@@ -129,7 +129,7 @@ Mac 到企业 upstream 是另一条独立的 TLS 信任链。若 mitmweb 的 Pyt
 ## 真机验收步骤
 
 1. 安装 0.4.0 签名 HAP，运行 `./bin/harmony-netbridge proxy --no-open-browser --mtu 1280`。
-2. 在 App 设置中选择分流模式，点击“名单管理”打开 APP 选择 Bottom Sheet 配置目标 App：白名单模式选中需要分流的其他 App，黑名单模式选中需要保持直连的 App。确认 HarmonyNetBridge 自身不出现在名单中；它会始终进入 Tunnel。关闭 Sheet 后主卡片应只显示已选 APP。开启 Tunnel，确认 UI 识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。
+2. 在 App 设置中选择分流模式，点击“名单管理”打开 APP 选择 Bottom Sheet 配置目标 App：白名单模式选中需要分流的其他 App，黑名单模式选中需要保持直连的 App。确认 HarmonyNetBridge 自身不出现在名单中；它会始终进入 Tunnel。关闭 Sheet 后主卡片应只显示已选 APP。开启 Tunnel，确认 UI 识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。另用一个不经过 VPN 的 App 验证其仍可通过设备原网络访问：白名单模式选择未勾选 App，黑名单模式选择已勾选 App；该 App 的请求不得出现在 mitmweb 中。
 3. App 点击“验证 HTTP 抓包链路”；确认 `PASS`、CLI `proxied TCP` 增长且 capture 大小增加。
 4. 在 mitmweb 中确认本次随机选中的 Google 或百度 HTTP flow。不要把请求头或认证数据复制到验收日志。
 5. 如需 HTTPS，在 App 点击“下载 Mac CA 证书”，成功后点击“用证书管理器打开”，在系统界面自行确认安装；未安装前的 TLS 信任失败属于预期边界。

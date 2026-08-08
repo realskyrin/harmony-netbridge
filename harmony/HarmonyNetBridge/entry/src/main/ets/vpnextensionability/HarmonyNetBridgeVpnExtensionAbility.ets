@@ -10,6 +10,7 @@ import hnbNative, {
 import { encodeUtf8 } from '../bridge/HnbProtocol';
 import {
   ALWAYS_TUNNELED_BUNDLE_NAME,
+  applyVpnApplicationRouting,
   AppRoutingMode,
   buildVpnApplicationRouting,
   canStartAppRouting,
@@ -221,10 +222,13 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       mtu: handshake.mtu,
       isIPv4Accepted: true,
       isIPv6Accepted: false,
-      isBlocking: false,
-      trustedApplications: appRouting.trustedApplications,
-      blockedApplications: appRouting.blockedApplications
+      isBlocking: false
     };
+    // HarmonyOS models both App filters as optional. Only send the active
+    // filter: some device builds select the whitelist path when the property
+    // exists even if its value is an empty array, which can make a non-empty
+    // blacklist ineffective and route excluded Apps into the VPN.
+    applyVpnApplicationRouting(config, appRouting);
     let tunFd: number;
     try {
       tunFd = await vpnConnection.create(config);

@@ -1,6 +1,8 @@
 import { describe, expect, it } from '@ohos/hypium';
+import { vpnExtension } from '@kit.NetworkKit';
 import {
   ALWAYS_TUNNELED_BUNDLE_NAME,
+  applyVpnApplicationRouting,
   AppRoutingMode,
   applicationUsesTunnel,
   buildVpnApplicationRouting,
@@ -55,22 +57,49 @@ export default function appWhitelistTest(): void {
         'com.example.mail'
       ];
       const whitelist: VpnApplicationRouting = buildVpnApplicationRouting(AppRoutingMode.WHITELIST, selected);
-      expect(whitelist.trustedApplications.length).assertEqual(3);
-      expect(whitelist.trustedApplications[0]).assertEqual(ALWAYS_TUNNELED_BUNDLE_NAME);
-      expect(whitelist.blockedApplications.length).assertEqual(0);
+      expect(whitelist.trustedApplications !== undefined).assertTrue();
+      expect(whitelist.trustedApplications?.length).assertEqual(3);
+      expect(whitelist.trustedApplications?.[0]).assertEqual(ALWAYS_TUNNELED_BUNDLE_NAME);
+      expect(whitelist.blockedApplications === undefined).assertTrue();
       const blacklist: VpnApplicationRouting = buildVpnApplicationRouting(AppRoutingMode.BLACKLIST, selected);
-      expect(blacklist.trustedApplications.length).assertEqual(0);
-      expect(blacklist.blockedApplications.length).assertEqual(2);
-      expect(blacklist.blockedApplications[0]).assertEqual('com.example.browser');
-      expect(blacklist.blockedApplications.indexOf(ALWAYS_TUNNELED_BUNDLE_NAME)).assertEqual(-1);
+      expect(blacklist.trustedApplications === undefined).assertTrue();
+      expect(blacklist.blockedApplications?.length).assertEqual(2);
+      expect(blacklist.blockedApplications?.[0]).assertEqual('com.example.browser');
+      expect(blacklist.blockedApplications?.indexOf(ALWAYS_TUNNELED_BUNDLE_NAME)).assertEqual(-1);
     });
 
     it('definesEmptySelectionByMode', 0, () => {
       expect(canStartAppRouting(AppRoutingMode.WHITELIST, [])).assertTrue();
       expect(canStartAppRouting(AppRoutingMode.BLACKLIST, [])).assertTrue();
       const whitelist: VpnApplicationRouting = buildVpnApplicationRouting(AppRoutingMode.WHITELIST, []);
-      expect(whitelist.trustedApplications.length).assertEqual(1);
-      expect(whitelist.trustedApplications[0]).assertEqual(ALWAYS_TUNNELED_BUNDLE_NAME);
+      expect(whitelist.trustedApplications?.length).assertEqual(1);
+      expect(whitelist.trustedApplications?.[0]).assertEqual(ALWAYS_TUNNELED_BUNDLE_NAME);
+      const blacklist: VpnApplicationRouting = buildVpnApplicationRouting(AppRoutingMode.BLACKLIST, []);
+      expect(blacklist.trustedApplications === undefined).assertTrue();
+      expect(blacklist.blockedApplications === undefined).assertTrue();
+    });
+
+    it('serializesOnlyTheActiveVpnApplicationFilter', 0, () => {
+      const whitelistConfig: vpnExtension.VpnConfig = { addresses: [] };
+      applyVpnApplicationRouting(whitelistConfig,
+        buildVpnApplicationRouting(AppRoutingMode.WHITELIST, ['com.example.browser']));
+      const encodedWhitelist: string = JSON.stringify(whitelistConfig);
+      expect(encodedWhitelist.indexOf('trustedApplications') >= 0).assertTrue();
+      expect(encodedWhitelist.indexOf('blockedApplications') < 0).assertTrue();
+
+      const blacklistConfig: vpnExtension.VpnConfig = { addresses: [] };
+      applyVpnApplicationRouting(blacklistConfig,
+        buildVpnApplicationRouting(AppRoutingMode.BLACKLIST, ['com.example.browser']));
+      const encodedBlacklist: string = JSON.stringify(blacklistConfig);
+      expect(encodedBlacklist.indexOf('trustedApplications') < 0).assertTrue();
+      expect(encodedBlacklist.indexOf('blockedApplications') >= 0).assertTrue();
+
+      const allApplicationsConfig: vpnExtension.VpnConfig = { addresses: [] };
+      applyVpnApplicationRouting(allApplicationsConfig,
+        buildVpnApplicationRouting(AppRoutingMode.BLACKLIST, []));
+      const encodedAllApplications: string = JSON.stringify(allApplicationsConfig);
+      expect(encodedAllApplications.indexOf('trustedApplications') < 0).assertTrue();
+      expect(encodedAllApplications.indexOf('blockedApplications') < 0).assertTrue();
     });
 
     it('detectsWhetherAnApplicationUsesTunnel', 0, () => {

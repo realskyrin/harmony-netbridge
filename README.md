@@ -146,7 +146,7 @@ HarmonyOS App：
 
 - APP 分流卡片始终只展示已选 APP，不在设置页平铺完整安装列表；点击“名单管理”后，二级 Bottom Sheet 才展示搜索和完整已安装 APP 列表，列表支持下拉刷新，已选 APP 自动排在未选 APP 前面。HarmonyNetBridge 自身会从已安装列表和历史选中结果中移除，并作为隐式规则始终进入 Tunnel。白名单与黑名单 Tab 共用同一份选中结果，切换模式不会复制、清空或替换已选 APP。
 - daemon 优先执行只读 `hdc shell bm dump -a -l` 获取本地化 APP 名称和 Bundle 名称；设备版本不支持标签输出时回退到 `bm dump -a`。列表请求必须携带当前控制会话的随机 token，连接断开后立即失效。
-- 白名单模式让本应用和选中 APP 进入 Tunnel，对应 Bundle 写入 `VpnConfig.trustedApplications`；黑名单模式让选中 APP 保持直连，其余 APP 进入 Tunnel，对应 Bundle 写入 `blockedApplications`，本应用不会被写入黑名单。两种模式不会同时下发非空列表。
+- 白名单模式让本应用和选中 APP 进入 Tunnel，只下发 `VpnConfig.trustedApplications`；黑名单模式让选中 APP 保持设备直连、其余 APP 进入 Tunnel，只下发 `blockedApplications`，本应用不会被写入黑名单。未启用的可选名单字段会被完全省略，不以空数组传给系统，避免设备错误选择名单策略。
 - 白名单为空时仍可创建 Tunnel，但只接管作为隐式白名单成员的 HarmonyNetBridge；黑名单为空表示不排除任何 APP，因此所有 APP 都会进入 Tunnel。
 - 默认和旧版本迁移结果均为白名单模式，原有已选 APP 保持不变。Tunnel 活动期间不能修改模式或列表；先关闭 Tunnel，修改后再次开启即可使用新配置。
 - 普通三方手机应用无权直接枚举完整已安装 APP 列表，因此 App 不申请系统级包管理权限；枚举动作由已选设备对应的本机 hdc 完成。

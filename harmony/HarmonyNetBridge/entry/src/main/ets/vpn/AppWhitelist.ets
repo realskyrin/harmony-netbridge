@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
+import { vpnExtension } from '@kit.NetworkKit';
 
 // Keep the original preferences namespace and selection key so existing users
 // retain their user-managed selections. The host App is migrated out because
@@ -27,10 +28,10 @@ export class AppRoutingPreferences {
 }
 
 export class VpnApplicationRouting {
-  readonly trustedApplications: string[];
-  readonly blockedApplications: string[];
+  readonly trustedApplications: string[] | undefined;
+  readonly blockedApplications: string[] | undefined;
 
-  constructor(trustedApplications: string[], blockedApplications: string[]) {
+  constructor(trustedApplications: string[] | undefined, blockedApplications: string[] | undefined) {
     this.trustedApplications = trustedApplications;
     this.blockedApplications = blockedApplications;
   }
@@ -134,20 +135,31 @@ export function buildVpnApplicationRouting(mode: AppRoutingMode,
   selectedApplications: string[]): VpnApplicationRouting {
   const normalized: string[] = normalizeSelectedApplications(selectedApplications);
   if (mode === AppRoutingMode.BLACKLIST) {
-    return new VpnApplicationRouting([], normalized);
+    return new VpnApplicationRouting(undefined, normalized.length > 0 ? normalized : undefined);
   }
   const trustedApplications: string[] = [ALWAYS_TUNNELED_BUNDLE_NAME];
   for (let index: number = 0; index < normalized.length; index++) {
     trustedApplications.push(normalized[index]);
   }
-  return new VpnApplicationRouting(trustedApplications, []);
+  return new VpnApplicationRouting(trustedApplications, undefined);
+}
+
+export function applyVpnApplicationRouting(config: vpnExtension.VpnConfig,
+  routing: VpnApplicationRouting): void {
+  if (routing.trustedApplications !== undefined) {
+    config.trustedApplications = routing.trustedApplications;
+  } else if (routing.blockedApplications !== undefined) {
+    config.blockedApplications = routing.blockedApplications;
+  }
 }
 
 export function canStartAppRouting(mode: AppRoutingMode, selectedApplications: string[]): boolean {
   if (mode === AppRoutingMode.BLACKLIST) {
     return true;
   }
-  return buildVpnApplicationRouting(mode, selectedApplications).trustedApplications.length > 0;
+  const trustedApplications: string[] | undefined =
+    buildVpnApplicationRouting(mode, selectedApplications).trustedApplications;
+  return trustedApplications !== undefined && trustedApplications.length > 0;
 }
 
 function sameApplicationSelection(stored: string[], normalized: string[]): boolean {
