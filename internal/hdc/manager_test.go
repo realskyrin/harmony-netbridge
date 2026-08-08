@@ -39,6 +39,61 @@ func TestParseTargetsEmptyAndFallback(t *testing.T) {
 	}
 }
 
+func TestParseInstalledApplicationLabels(t *testing.T) {
+	t.Parallel()
+	output := `[
+  {"bundleName":"com.example.mail","label":"Mail"},
+  {"bundleName":"com.example.browser","label":"Browser"},
+  {"bundleName":"com.example.mail","label":"Duplicate"},
+  {"bundleName":"invalid","label":"Ignored"}
+]`
+	want := []InstalledApplication{
+		{BundleName: "com.example.browser", Label: "Browser"},
+		{BundleName: "com.example.mail", Label: "Mail"},
+	}
+	if got := ParseInstalledApplicationLabels(output); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseInstalledApplicationLabels() = %#v, want %#v", got, want)
+	}
+	if got := ParseInstalledApplicationLabels("not-json"); len(got) != 0 {
+		t.Fatalf("malformed label output parsed as %#v", got)
+	}
+}
+
+func TestParseInstalledApplicationNames(t *testing.T) {
+	t.Parallel()
+	output := "ID: 100:\n\tcom.example.mail\n\tcom.example.browser\n\tinvalid\n"
+	want := []InstalledApplication{
+		{BundleName: "com.example.browser"},
+		{BundleName: "com.example.mail"},
+	}
+	if got := ParseInstalledApplicationNames(output); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseInstalledApplicationNames() = %#v, want %#v", got, want)
+	}
+}
+
+func TestManagerListsInstalledApplicationsWithLabelFallback(t *testing.T) {
+	t.Parallel()
+	runner := &recordingRunner{outputs: []string{
+		"dump failed",
+		"ID: 100:\n\tcom.example.browser",
+	}}
+	manager := &Manager{Path: "/test/hdc", Runner: runner}
+	applications, err := manager.ListInstalledApplications(context.Background(), "secret-device-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applications) != 1 || applications[0].BundleName != "com.example.browser" {
+		t.Fatalf("applications = %#v", applications)
+	}
+	want := [][]string{
+		{"-t", "secret-device-id", "shell", "bm", "dump", "-a", "-l"},
+		{"-t", "secret-device-id", "shell", "bm", "dump", "-a"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestSelectTarget(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

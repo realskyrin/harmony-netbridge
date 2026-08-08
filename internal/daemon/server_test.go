@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -37,6 +39,12 @@ type fakeForwarder struct {
 	mu        sync.Mutex
 	removed   []hdc.Mapping
 	removeErr error
+}
+
+type fakeAppLister struct {
+	applications []hdc.InstalledApplication
+	err          error
+	targetID     string
 }
 
 type fakePacketRelay struct {
@@ -119,6 +127,12 @@ func (f *fakeForwarder) Remove(_ context.Context, _ string, mapping hdc.Mapping)
 	return f.removeErr
 }
 
+func (l *fakeAppLister) ListInstalledApplications(_ context.Context,
+	targetID string) ([]hdc.InstalledApplication, error) {
+	l.targetID = targetID
+	return l.applications, l.err
+}
+
 func TestNewRejectsUnsafeVPNMTU(t *testing.T) {
 	t.Parallel()
 	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 1)}
@@ -188,6 +202,86 @@ func TestServerRefusesCertificateWithoutActiveManagedProxy(t *testing.T) {
 		"GET /mitmproxy-ca-cert.cer HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("standard daemon certificate status = %d", response.StatusCode)
+	}
+}
+
+func TestServerServesInstalledApplicationsForSelectedDevice(t *testing.T) {
+	t.Parallel()
+	const token = "0123456789abcdef0123456789abcdef"
+	controlConnection, controlPeer := net.Pipe()
+	defer controlConnection.Close()
+	defer controlPeer.Close()
+	lister := &fakeAppLister{applications: []hdc.InstalledApplication{
+		{BundleName: "com.example.browser", Label: "Browser"},
+		{BundleName: "com.example.mail", Label: "Mail"},
+	}}
+	server := &Server{config: Config{
+		DeviceID:         "selected-device",
+		DeviceLabel:      "device-redacted",
+		HandshakeTimeout: time.Second,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AppLister:        lister,
+	}, controlConnection: controlConnection, controlToken: token}
+	response, body := exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /installed-apps.json HTTP/1.1\r\nHost: 127.0.0.1\r\n"+
+			"Authorization: Bearer "+token+"\r\nConnection: close\r\n\r\n")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("installed applications status = %d, body = %q", response.StatusCode, body)
+	}
+	if lister.targetID != "selected-device" {
+		t.Fatalf("AppLister target = %q", lister.targetID)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", contentType)
+	}
+	var payload struct {
+		Applications []hdc.InstalledApplication `json:"applications"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(payload.Applications, lister.applications) {
+		t.Fatalf("applications = %#v, want %#v", payload.Applications, lister.applications)
+	}
+}
+
+func TestServerRefusesUnavailableInstalledApplicationList(t *testing.T) {
+	t.Parallel()
+	const token = "abcdef0123456789abcdef0123456789"
+	controlConnection, controlPeer := net.Pipe()
+	defer controlConnection.Close()
+	defer controlPeer.Close()
+	server := &Server{config: Config{
+		DeviceID:         "selected-device",
+		DeviceLabel:      "device-redacted",
+		HandshakeTimeout: time.Second,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AppLister:        &fakeAppLister{err: errors.New("fixture unavailable")},
+	}, controlConnection: controlConnection, controlToken: token}
+	response, _ := exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /installed-apps.json HTTP/1.1\r\nHost: 127.0.0.1\r\n"+
+			"Authorization: Bearer "+token+"\r\n\r\n")
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unavailable installed applications status = %d", response.StatusCode)
+	}
+}
+
+func TestServerRequiresCurrentControlTokenForInstalledApplicationList(t *testing.T) {
+	t.Parallel()
+	server := &Server{config: Config{
+		DeviceID:         "selected-device",
+		DeviceLabel:      "device-redacted",
+		HandshakeTimeout: time.Second,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AppLister: &fakeAppLister{applications: []hdc.InstalledApplication{
+			{BundleName: "com.example.browser", Label: "Browser"},
+		}},
+	}}
+	response, _ := exchangeDeviceHTTP(t, server, http.MethodGet,
+		"GET /installed-apps.json HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+	if response.StatusCode != http.StatusUnauthorized || response.Header.Get("WWW-Authenticate") == "" {
+		t.Fatalf("unauthorized installed applications response = %d, challenge = %q",
+			response.StatusCode, response.Header.Get("WWW-Authenticate"))
 	}
 }
 

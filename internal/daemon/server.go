@@ -6,8 +6,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,14 +45,22 @@ const (
 	controlStopAckTimeout    = 2 * time.Second
 	cleanupTimeout           = 5 * time.Second
 	certificateDownloadPath  = "/mitmproxy-ca-cert.cer"
+	installedAppsPath        = "/installed-apps.json"
 	maxCertificateBytes      = 64 * 1024
 	maxHTTPRequestBytes      = 8 * 1024
+	maxInstalledAppsBytes    = 1024 * 1024
 )
 
 // Forwarder is the narrow hdc capability owned by the daemon.
 type Forwarder interface {
 	AddReverse(ctx context.Context, targetID string, mapping hdc.Mapping) error
 	Remove(ctx context.Context, targetID string, mapping hdc.Mapping) error
+}
+
+// AppLister is the read-only hdc capability used by the phone's application
+// picker. It is deliberately separate from VPN forwarding ownership.
+type AppLister interface {
+	ListInstalledApplications(ctx context.Context, targetID string) ([]hdc.InstalledApplication, error)
 }
 
 // PacketRelay is the data-plane boundary owned by one HNB VPN session.
@@ -88,6 +99,7 @@ type Config struct {
 	DevicePort        int
 	MTU               int
 	Forwarder         Forwarder
+	AppLister         AppLister
 	Logger            *slog.Logger
 	Now               func() time.Time
 	HandshakeTimeout  time.Duration
@@ -429,7 +441,7 @@ func (s *Server) handleDevice(connection net.Conn) {
 	}
 	reader := io.MultiReader(bytes.NewReader(prefix), connection)
 	if looksLikeHTTPRequest(prefix) {
-		s.handleCertificateRequest(connection, reader)
+		s.handleDeviceHTTPRequest(connection, reader)
 		return
 	}
 	frame, err := protocol.ReadFrame(reader)
@@ -461,37 +473,99 @@ func looksLikeHTTPRequest(prefix []byte) bool {
 	}
 }
 
-// handleCertificateRequest shares the existing hdc loopback mapping with HNB/1
-// without exposing another device port. Only the current managed proxy's public
-// CA certificate is served; private keys, capture files, and mitmweb metadata
-// are never addressable through this handler.
-func (s *Server) handleCertificateRequest(connection net.Conn, reader io.Reader) {
+// handleDeviceHTTPRequest shares the existing hdc loopback mapping with HNB/1
+// without exposing another device port. It serves only the installed-App picker
+// data and the current managed proxy's public CA certificate; private keys,
+// capture files, and mitmweb metadata are never addressable through this handler.
+func (s *Server) handleDeviceHTTPRequest(connection net.Conn, reader io.Reader) {
 	limited := &io.LimitedReader{R: reader, N: maxHTTPRequestBytes + 1}
 	request, err := http.ReadRequest(bufio.NewReader(limited))
 	if err != nil {
-		writeCertificateHTTPResponse(connection, http.StatusBadRequest, nil, nil)
+		writeDeviceHTTPResponse(connection, http.StatusBadRequest, nil, nil)
 		return
 	}
 	if request.Body != nil {
 		_ = request.Body.Close()
 	}
 	if request.Method != http.MethodGet {
-		writeCertificateHTTPResponse(connection, http.StatusMethodNotAllowed, nil, http.Header{"Allow": []string{http.MethodGet}})
+		writeDeviceHTTPResponse(connection, http.StatusMethodNotAllowed, nil, http.Header{"Allow": []string{http.MethodGet}})
 		return
 	}
-	if request.URL.Path != certificateDownloadPath || request.URL.RawQuery != "" {
-		writeCertificateHTTPResponse(connection, http.StatusNotFound, nil, nil)
+	if request.URL.RawQuery != "" {
+		writeDeviceHTTPResponse(connection, http.StatusNotFound, nil, nil)
 		return
 	}
+	switch request.URL.Path {
+	case installedAppsPath:
+		s.handleInstalledAppsRequest(connection, request.Header.Get("Authorization"))
+	case certificateDownloadPath:
+		s.handleCertificateDownloadRequest(connection)
+	default:
+		writeDeviceHTTPResponse(connection, http.StatusNotFound, nil, nil)
+	}
+}
+
+func (s *Server) handleInstalledAppsRequest(connection net.Conn, authorization string) {
+	if !s.validControlAuthorization(authorization) {
+		writeDeviceHTTPResponse(connection, http.StatusUnauthorized, nil, http.Header{
+			"WWW-Authenticate": []string{`Bearer realm="HarmonyNetBridge"`},
+		})
+		return
+	}
+	if s.config.AppLister == nil {
+		writeDeviceHTTPResponse(connection, http.StatusServiceUnavailable, nil, nil)
+		return
+	}
+	requestContext, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	defer cancel()
+	applications, err := s.config.AppLister.ListInstalledApplications(requestContext, s.config.DeviceID)
+	if err != nil || len(applications) == 0 {
+		writeDeviceHTTPResponse(connection, http.StatusServiceUnavailable, nil, nil)
+		s.config.Logger.Warn("installed application list unavailable", "device", s.config.DeviceLabel)
+		return
+	}
+	payload, err := json.Marshal(struct {
+		Applications []hdc.InstalledApplication `json:"applications"`
+	}{Applications: applications})
+	if err != nil || len(payload) == 0 || len(payload) > maxInstalledAppsBytes {
+		writeDeviceHTTPResponse(connection, http.StatusInternalServerError, nil, nil)
+		return
+	}
+	writeDeviceHTTPResponse(connection, http.StatusOK, payload, http.Header{
+		"Content-Type": []string{"application/json; charset=utf-8"},
+	})
+	s.config.Logger.Info("served installed application list", "device", s.config.DeviceLabel,
+		"applications", len(applications))
+}
+
+func (s *Server) validControlAuthorization(authorization string) bool {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authorization, prefix) {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+	if !protocol.ValidSessionToken(token) {
+		return false
+	}
+	s.mu.Lock()
+	currentToken := s.controlToken
+	controlConnected := s.controlConnection != nil
+	s.mu.Unlock()
+	return controlConnected && len(token) == len(currentToken) &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(currentToken)) == 1
+}
+
+func (s *Server) handleCertificateDownloadRequest(connection net.Conn) {
 
 	certificate, err := s.currentProxyCACertificate()
 	if err != nil {
-		writeCertificateHTTPResponse(connection, http.StatusServiceUnavailable, nil, nil)
+		writeDeviceHTTPResponse(connection, http.StatusServiceUnavailable, nil, nil)
 		s.config.Logger.Warn("mitmproxy CA download unavailable", "device", s.config.DeviceLabel)
 		return
 	}
-	writeCertificateHTTPResponse(connection, http.StatusOK, certificate, http.Header{
+	writeDeviceHTTPResponse(connection, http.StatusOK, certificate, http.Header{
 		"Content-Disposition": []string{`attachment; filename="mitmproxy-ca-cert.cer"`},
+		"Content-Type":        []string{"application/pkix-cert"},
 	})
 	s.config.Logger.Info("served mitmproxy CA certificate", "device", s.config.DeviceLabel, "bytes", len(certificate))
 }
@@ -547,7 +621,7 @@ func validateCACertificate(payload []byte) error {
 	return nil
 }
 
-func writeCertificateHTTPResponse(connection net.Conn, statusCode int, body []byte, headers http.Header) {
+func writeDeviceHTTPResponse(connection net.Conn, statusCode int, body []byte, headers http.Header) {
 	if body == nil {
 		body = []byte(http.StatusText(statusCode) + "\n")
 	}
@@ -556,9 +630,8 @@ func writeCertificateHTTPResponse(connection net.Conn, statusCode int, body []by
 		responseHeaders[name] = append([]string(nil), values...)
 	}
 	responseHeaders.Set("Cache-Control", "no-store")
-	responseHeaders.Set("Content-Type", "text/plain; charset=utf-8")
-	if statusCode == http.StatusOK {
-		responseHeaders.Set("Content-Type", "application/pkix-cert")
+	if responseHeaders.Get("Content-Type") == "" {
+		responseHeaders.Set("Content-Type", "text/plain; charset=utf-8")
 	}
 	response := &http.Response{
 		StatusCode:    statusCode,

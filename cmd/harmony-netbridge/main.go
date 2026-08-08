@@ -369,6 +369,7 @@ func daemonCommand(parsed invocation, paths runtimepath.Paths) error {
 		DevicePort:    parsed.devicePort,
 		MTU:           parsed.mtu,
 		Forwarder:     manager,
+		AppLister:     manager,
 		Logger:        logger,
 		ProxyFactory:  proxyFactory,
 		ProxyRecovery: proxybridge.RecoverManaged,

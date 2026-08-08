@@ -51,9 +51,14 @@ export class BridgeSession {
   );
   private manualClosing: boolean = false;
   private nextOutgoingSequence: number = 1;
+  private currentSessionToken: string = '';
 
   get snapshot(): BridgeSnapshot {
     return this.current;
+  }
+
+  get sessionToken(): string {
+    return this.currentSessionToken;
   }
 
   setListener(listener: BridgeListener | undefined): void {
@@ -70,6 +75,7 @@ export class BridgeSession {
     this.manualClosing = false;
     this.decoder.reset();
     this.nextOutgoingSequence = 1;
+    this.currentSessionToken = '';
     this.publish(new BridgeSnapshot(
       BridgeConnectionState.CONNECTING,
       '正在连接 Mac',
@@ -180,6 +186,7 @@ export class BridgeSession {
           !/^[0-9a-f]{32}$/.test(ack.sessionToken)) {
           throw new Error('Mac returned an invalid HELLO_ACK');
         }
+        this.currentSessionToken = ack.sessionToken;
         this.publish(new BridgeSnapshot(
           BridgeConnectionState.CONNECTED,
           'Mac 控制通道已连接',
@@ -233,6 +240,7 @@ export class BridgeSession {
   private async closeClient(client: socket.TCPSocket): Promise<void> {
     if (this.client === client) {
       this.client = undefined;
+      this.currentSessionToken = '';
     }
     client.off('message');
     client.off('close');

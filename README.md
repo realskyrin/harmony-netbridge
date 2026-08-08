@@ -2,7 +2,7 @@
 
 HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥。它不依赖 Android API，让鸿蒙设备通过 USB 与 `hdc` 复用 Mac 当前的网络路由，包括企业 Wi-Fi、Cisco AnyConnect 等开发环境。
 
-当前仓库已实现 **Phase 4 单设备开发版**：HarmonyOS `VpnExtensionAbility` 接管默认 IPv4 路由，Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS；`proxy` 模式还会安全托管一个 loopback-only mitmweb，把常见 HTTP/HTTPS TCP 流量接入抓包链路。
+当前仓库已实现 **Phase 4 单设备开发版**：HarmonyOS `VpnExtensionAbility` 只接管用户白名单中的 App，并为这些 App 配置默认 IPv4 路由；Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS。`proxy` 模式还会安全托管一个 loopback-only mitmweb，把白名单 App 的常见 HTTP/HTTPS TCP 流量接入抓包链路。
 
 ## 当前能力
 
@@ -14,6 +14,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - 抓包模式拦截 TCP 80/443/8080/8443；UDP/443 被拒绝以促使 QUIC 回退 TCP，其他 UDP、DNS 和非 HTTP TCP 仍按标准模式转发。
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
 - HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
+- App 设置页从当前设备的已安装 APP 列表中搜索、勾选并持久化 VPN 白名单，再把对应 Bundle 名称写入 `VpnConfig.trustedApplications`；未选中的 App 保持设备原网络，空白名单时拒绝启动 Tunnel。
 - `start --mtu 576...1500`：由 Mac 在握手中下发 MTU，设备 VPN 与 gVisor relay 使用同一值，默认 1400。
 - Native C++ `PacketPump` 独占 TUN fd 与 Data socket，支持双向 raw IPv4 packet。
 - Control 与 Data 各自每 5 秒发送 HNB 心跳；连续 15 秒未收到对应响应即关闭失效会话，避免保留黑洞默认路由。
@@ -30,7 +31,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 ## 架构
 
 ```text
-HarmonyOS NEXT Apps / System IPv4 traffic
+HarmonyOS NEXT whitelisted Apps IPv4 traffic
                     │
                     ▼
           VpnExtensionAbility
@@ -104,7 +105,7 @@ HarmonyOS App：
    ./bin/harmony-netbridge --mtu 1400 start
    ```
 
-3. 打开 HarmonyNetBridge App，点击“启动 VPN”。首次使用时确认 HarmonyOS 的 VPN 授权提示。
+3. 打开 HarmonyNetBridge App，进入“设置 → APP 白名单”，在已安装 APP 列表中搜索并勾选需要分流的应用，然后开启 VPN Tunnel。首次使用时确认 HarmonyOS 的 VPN 授权提示。
 4. 查看 Mac 状态：
 
    ```bash
@@ -122,7 +123,7 @@ HarmonyOS App：
    Message:   IPv4 TCP, UDP, and DNS relay is active
    ```
 
-5. 在 App 中点击“运行 TCP / UDP / DNS 自检”。`PASS` 表示 UDP DNS 和 TCP DNS 都已通过真实 VPN 数据面返回。
+5. 若要运行 App 内置网络/抓包自检，还需把 `io.github.realskyrin.harmonynetbridge` 自身加入白名单；否则自检按钮会保持禁用，避免把直连结果误判为 VPN 数据面结果。`PASS` 表示 UDP DNS 和 TCP DNS 都已通过真实 VPN 数据面返回。
 6. 停止时运行：
 
    ```bash
@@ -130,6 +131,15 @@ HarmonyOS App：
    ```
 
    daemon 会先向 App 发送 `STOP_REQUEST`；设备停止 PacketPump、销毁 VPN 后，Mac 只删除本实例创建的精确 hdc 映射。
+
+### APP 白名单分流
+
+- 设置页通过当前 HNB 控制会话，从 Mac daemon 读取设备上的已安装 APP 名称与 Bundle 名称；用户通过搜索和勾选维护白名单，无需手工填写 Bundle ID。
+- daemon 优先执行只读 `hdc shell bm dump -a -l` 获取本地化 APP 名称和 Bundle 名称；设备版本不支持标签输出时回退到 `bm dump -a`。列表请求必须携带当前控制会话的随机 token，连接断开后立即失效。
+- Tunnel 创建时只把已保存的 Bundle 名称传给 HarmonyOS `VpnConfig.trustedApplications`，`blockedApplications` 保持为空。
+- 空白名单采用 fail-closed：UI 与 VPN Extension 都会拒绝创建 Tunnel，不会把空数组解释成“接管全部 App”。
+- Tunnel 活动期间不能修改白名单；先关闭 Tunnel，修改后再次开启即可使用新配置。
+- 普通三方手机应用无权直接枚举完整已安装 APP 列表，因此 App 不申请系统级包管理权限；枚举动作由已选设备对应的本机 hdc 完成。
 
 ### 抓包模式
 
@@ -161,7 +171,7 @@ HarmonyOS App：
 
 该开关不会替代手机对 mitmproxy CA 的信任，只影响 mitmweb 到 upstream/目标服务器的 TLS 身份校验。默认仍严格校验；启用后 `status` 会明确显示 `TLS verify: DISABLED`。
 
-随后在 App 点击“启动 VPN”，再点击“验证 HTTP 抓包链路”。HTTP 可立即在 mitmweb 中查看。HTTPS 请点击“下载 Mac CA 证书”，下载完成后点击“用证书管理器打开”，再由 HarmonyOS 系统界面确认安装与信任；不再需要去外部站点下载。App pinning、企业策略或不信任用户 CA 的应用仍可能拒绝解密，这不是隧道故障。
+随后在 App 开启 VPN Tunnel，再点击“验证 HTTP 抓包链路”。HTTP 可立即在 mitmweb 中查看。HTTPS 请点击“下载 Mac CA 证书”，下载完成后点击“用证书管理器打开”，再由 HarmonyOS 系统界面确认安装与信任；不再需要去外部站点下载。App pinning、企业策略或不信任用户 CA 的应用仍可能拒绝解密，这不是隧道故障。
 
 `status` 会显示代理状态、capture 文件、公共 CA 路径、已接入代理的 TCP flow 数和 QUIC 回退计数，但不会显示 mitmweb token、请求头或 flow 内容。默认文件位于：
 
@@ -190,13 +200,13 @@ capture、日志与 CA 文件使用 `0600`，所属目录使用 `0700`。停止�
 脚本覆盖：
 
 - Go race tests、`go vet`、macOS arm64 构建。
-- HNB/1 parser、Control/Data 会话关联、daemon 生命周期和 hdc 映射清理。
+- HNB/1 parser、Control/Data 会话关联、daemon 生命周期、hdc 映射清理，以及已安装 APP 标签/Bundle 列表解析与回退。
 - MTU 参数边界、双通道心跳、心跳 RTT 状态与单设备重连计数。
 - gVisor 内存网络中的真实 TCP、UDP、UDP DNS 与 TCP DNS 往返。
 - HTTP CONNECT 适配、非 2xx/超长响应拒绝、buffered tunnel 数据保留、代理 flow 统计与 UDP/443 回退。
 - mitmweb upstream 参数、TLS 校验开关、受管生命周期、私有 capture/CA 权限、两个只读 CA 下载端点和精确 orphan 识别。
 - macOS resolver 失效刷新与 UDP DNS 截断后的 TCP 重试。
-- ArkTS 协议、MTU、重连退避、DNS TCP 分片、CA 下载响应边界与 `mitm.it` 响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
+- ArkTS 协议、MTU、重连退避、DNS TCP 分片、已安装 APP 列表解码/搜索、CA 下载响应边界与 `mitm.it` 响应判定测试，Native CMake/Ninja 构建和 HAP 打包。
 
 这些检查不能替代真机证据。2026-08-06 已在单台物理设备完成 Phase 3 的 MTU、双向流量、心跳和故障恢复验收；Phase 4 的当前真机与 mitmweb 证据见 [Phase 4 文档](docs/phase-4.md)。跨小时、休眠唤醒和吞吐基准仍未执行。
 

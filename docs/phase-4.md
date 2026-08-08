@@ -4,6 +4,8 @@
 
 Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修改手机全局代理，也不改变 HNB/1 帧格式。
 
+当前 App 在这一数据面前增加了按 App 白名单分流：设置页通过当前 HNB 控制会话读取设备上的已安装 APP 列表，用户搜索并勾选应用后，对应 Bundle 名称才会写入 `VpnConfig.trustedApplications` 并进入 TUN；其他 App 保持直连，空白名单不会创建 VPN。
+
 已实现：
 
 - `harmony-netbridge proxy`：检查 `mitmweb`、启动 loopback regular proxy 与 Web UI、创建独立 `.mitm` capture，并继续启动原有 VPN relay。
@@ -12,13 +14,14 @@ Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修�
 - 代理模式拒绝 UDP/443，促使支持回退的客户端从 HTTP/3/QUIC 改用可抓取的 TCP。此行为不会伪装成已抓取 HTTP/3。
 - HNB/1 `HELLO_ACK.capabilities` 增加可选 `proxy`；Harmony App 据此展示模式并提供 `http://mitm.it` HTTP 链路自检。
 - daemon 在同一 hdc loopback 端口提供唯一只读路径 `/mitmproxy-ca-cert.cer`；仅代理模式可用，并在发送前验证文件是有界的 X.509 CA。其他 proxy 文件、私钥、capture 与 Web UI 信息均不可寻址。
+- daemon 在同一端口提供 `/installed-apps.json`：优先以 `bm dump -a -l` 返回本地化 APP 名称与 Bundle 名称，不支持时回退 `bm dump -a`；接口只接受当前 HNB 控制会话的随机 Bearer token，不申请手机端系统级包管理权限。
 - App 可将该公共 CA 直接保存到手机应用目录，再以 `general.cer-certificate` 文件类型和只读 URI 授权交给系统证书管理器；不请求 `MANAGE_VPN`，不静默安装证书，也不修改系统信任策略。
 - daemon 正常停止会先停止手机 VPN，再终止本次启动的 mitmweb；异常退出后的下一次启动只在 PID 与完整受管参数均匹配时回收 orphan。
 
 ## 数据路径
 
 ```text
-HarmonyOS IPv4 traffic
+Whitelisted HarmonyOS Apps IPv4 traffic
         │
         ▼
 VpnExtensionAbility / TUN / PacketPump
@@ -106,6 +109,8 @@ Mac 到企业 upstream 是另一条独立的 TLS 信任链。若 mitmweb 的 Pyt
 
 ## 本轮真机结果（2026-08-06）
 
+以下结果记录的是白名单功能加入前的 Phase 4 基线；它不构成当前按 App 分流的真机验证。当前版本复测时必须先把目标 App 加入白名单，把 HarmonyNetBridge 自身加入白名单后才能使用内置自检。
+
 在一台已授权 USB 调试的 HarmonyOS NEXT 真机上安装 0.4.0 签名 HAP 后完成：
 
 - 以 `proxy --no-open-browser --mtu 1280` 启动；App 与 CLI 均报告 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`，App 明确显示“Mac USB 抓包通道已接管”。
@@ -124,7 +129,7 @@ Mac 到企业 upstream 是另一条独立的 TLS 信任链。若 mitmweb 的 Pyt
 ## 真机验收步骤
 
 1. 安装 0.4.0 签名 HAP，运行 `./bin/harmony-netbridge proxy --no-open-browser --mtu 1280`。
-2. App 点击“启动 VPN”，确认 UI 识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。
+2. 在 App 设置中把目标 App 加入白名单；如需第 3 步的内置自检，同时加入 `io.github.realskyrin.harmonynetbridge`。开启 Tunnel，确认 UI 识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。
 3. App 点击“验证 HTTP 抓包链路”；确认 `PASS`、CLI `proxied TCP` 增长且 capture 大小增加。
 4. 在 mitmweb 中确认 `mitm.it` HTTP flow。不要把请求头或认证数据复制到验收日志。
 5. 如需 HTTPS，在 App 点击“下载 Mac CA 证书”，成功后点击“用证书管理器打开”，在系统界面自行确认安装；未安装前的 TLS 信任失败属于预期边界。

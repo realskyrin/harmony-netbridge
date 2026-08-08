@@ -6,6 +6,16 @@ import {
   BridgeSnapshot,
   bridgeSession
 } from '../bridge/BridgeSession';
+import {
+  loadTrustedApplications,
+  saveTrustedApplications
+} from '../vpn/AppWhitelist';
+import {
+  applicationDisplayName,
+  filterInstalledApplications,
+  InstalledApplication,
+  InstalledApplicationSource
+} from '../vpn/InstalledApplications';
 import { VpnDiagnosticResult, VpnNetworkDiagnostics } from '../vpn/VpnNetworkDiagnostics';
 import { ProxyCertificate } from '../vpn/ProxyCertificate';
 import { ProxyDiagnostics } from '../vpn/ProxyDiagnostics';
@@ -35,9 +45,20 @@ struct Index {
   @State certificateState: string = 'NOT_DOWNLOADED';
   @State certificateDetail: string = '证书仅通过 USB 从当前 Mac 下载，不会访问外部证书站点';
   @State certificateDownloaded: boolean = false;
+  @State trustedApplications: string[] = [];
+  @State whitelistLoaded: boolean = false;
+  @State whitelistSaving: boolean = false;
+  @State whitelistDetail: string = '正在读取应用白名单';
+  @State whitelistError: string = '';
+  @State installedApplications: InstalledApplication[] = [];
+  @State applicationSearch: string = '';
+  @State applicationListLoaded: boolean = false;
+  @State applicationListLoading: boolean = false;
+  @State applicationListError: string = '';
   @State showSettings: boolean = false;
   @State developerOptionsError: string = '';
   private proxyCertificate: ProxyCertificate = new ProxyCertificate();
+  private installedApplicationSource: InstalledApplicationSource = new InstalledApplicationSource();
   private vpnStatusTimer: number = -1;
   private vpnStatusSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
 
@@ -46,10 +67,19 @@ struct Index {
       this.connectionState = snapshot.state;
       this.statusTitle = snapshot.title;
       this.statusDetail = snapshot.detail;
+      if (snapshot.state === BridgeConnectionState.CONNECTED && this.showSettings &&
+        !this.applicationListLoaded && !this.applicationListLoading) {
+        this.loadInstalledApplicationList();
+      } else if ((snapshot.state === BridgeConnectionState.ERROR ||
+        snapshot.state === BridgeConnectionState.DISCONNECTED) && this.showSettings &&
+        !this.applicationListLoaded) {
+        this.applicationListError = '无法读取已安装 APP：Mac 控制通道未连接';
+      }
     });
     this.subscribeVpnStatus();
     this.refreshVpnStatus();
     this.refreshCertificateStatus();
+    this.loadAppWhitelist();
     this.vpnStatusTimer = setInterval(() => {
       this.refreshVpnStatus();
     }, 500);
@@ -132,6 +162,9 @@ struct Index {
     if (this.connectionState === BridgeConnectionState.CONNECTED) {
       return 'Mac 服务已就绪';
     }
+    if (this.whitelistLoaded && this.trustedApplications.length === 0) {
+      return '先选择需要分流的应用';
+    }
     return '通过 USB 使用 Mac 网络';
   }
 
@@ -147,14 +180,16 @@ struct Index {
     }
     if (this.vpnState === 'ACTIVE') {
       return this.proxyEnabled ?
-        '设备流量正通过 USB 转发到 Mac，并启用 HTTP(S) 抓包' :
-        '设备流量正通过 USB 转发，并使用 Mac 当前的网络连接';
+        `白名单中的 ${this.trustedApplications.length} 个应用正通过 USB 转发到 Mac，并启用 HTTP(S) 抓包` :
+        `白名单中的 ${this.trustedApplications.length} 个应用正使用 Mac 网络，其余应用保持直连`;
     }
     if (this.vpnState === 'FAILED') {
       return this.vpnDetail;
     }
     if (this.connectionState === BridgeConnectionState.CONNECTED) {
-      return '开启 VPN Tunnel 后，设备流量将自动切换到 Mac';
+      return this.trustedApplications.length > 0 ?
+        '开启 VPN Tunnel 后，仅白名单应用会切换到 Mac 网络' :
+        '请先在设置中添加需要通过 Tunnel 的应用';
     }
     return '请先在 Mac 启动 HarmonyNetBridge 服务，然后开启 VPN Tunnel';
   }
@@ -187,6 +222,12 @@ struct Index {
   }
 
   private async requestVpnStart(): Promise<void> {
+    if (!this.whitelistLoaded || this.trustedApplications.length === 0) {
+      this.whitelistError = this.whitelistLoaded ?
+        '请至少添加一个应用后再开启 Tunnel' : '应用白名单尚未加载完成，请稍候重试';
+      this.showSettings = true;
+      return;
+    }
     VpnRuntimeState.publish('STARTING', '正在准备 USB 网络通道', false);
     this.refreshVpnStatus();
     try {
@@ -194,7 +235,10 @@ struct Index {
       await vpnExtension.startVpnExtensionAbility({
         bundleName: BUNDLE_NAME,
         abilityName: EXTENSION_NAME,
-        parameters: { mode: 'vpn' }
+        parameters: {
+          mode: 'vpn',
+          trustedApplications: JSON.stringify(this.trustedApplications)
+        }
       });
     } catch (error) {
       const businessError: BusinessError = error as BusinessError;
@@ -242,7 +286,8 @@ struct Index {
   }
 
   private async requestNetworkDiagnostics(): Promise<void> {
-    if (this.vpnState !== 'ACTIVE' || this.diagnosticState === 'RUNNING') {
+    if (this.vpnState !== 'ACTIVE' || !this.whitelistContainsBridgeApp() ||
+      this.diagnosticState === 'RUNNING') {
       return;
     }
     this.diagnosticState = 'RUNNING';
@@ -259,7 +304,8 @@ struct Index {
   }
 
   private async requestProxyDiagnostics(): Promise<void> {
-    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || this.proxyDiagnosticState === 'RUNNING') {
+    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || !this.whitelistContainsBridgeApp() ||
+      this.proxyDiagnosticState === 'RUNNING') {
       return;
     }
     this.proxyDiagnosticState = 'RUNNING';
@@ -363,7 +409,7 @@ struct Index {
   private vpnToggleDetail(): string {
     switch (this.vpnState) {
       case 'ACTIVE':
-        return this.proxyEnabled ? '抓包模式' : '标准转发模式';
+        return `${this.trustedApplications.length} 个应用 · ${this.proxyEnabled ? '抓包模式' : '标准转发模式'}`;
       case 'STARTING':
       case 'AUTH_REQUIRED':
         return '正在建立安全连接';
@@ -374,8 +420,144 @@ struct Index {
       case 'FAILED':
         return '点击重试';
       default:
-        return '点击开启';
+        return this.trustedApplications.length > 0 ?
+          `${this.trustedApplications.length} 个应用 · 点击开启` : '请先配置应用白名单';
     }
+  }
+
+  private async loadAppWhitelist(): Promise<void> {
+    this.whitelistError = '';
+    try {
+      this.trustedApplications = await loadTrustedApplications(this.uiAbilityContext());
+      this.whitelistDetail = this.trustedApplications.length > 0 ?
+        `已选择 ${this.trustedApplications.length} 个应用，仅这些应用会经过 VPN` :
+        '尚未添加应用；空白名单时 Tunnel 不会启动';
+    } catch (error) {
+      const loadError: Error = error as Error;
+      this.whitelistError = `无法读取应用白名单：${loadError.message}`;
+      this.whitelistDetail = '请重新选择应用；Tunnel 会在白名单为空时拒绝启动';
+    } finally {
+      this.whitelistLoaded = true;
+    }
+  }
+
+  private whitelistEditable(): boolean {
+    return this.whitelistLoaded && !this.whitelistSaving && !this.vpnSwitchOn() && this.vpnState !== 'STOPPING';
+  }
+
+  private whitelistContainsBridgeApp(): boolean {
+    return this.trustedApplications.indexOf(BUNDLE_NAME) >= 0;
+  }
+
+  private whitelistStatusLabel(): string {
+    if (!this.whitelistLoaded) {
+      return '加载中';
+    }
+    if (this.whitelistSaving) {
+      return '保存中';
+    }
+    return this.trustedApplications.length === 0 ? '未配置' : `${this.trustedApplications.length} 个应用`;
+  }
+
+  private whitelistStatusColor(): string {
+    if (!this.whitelistLoaded || this.whitelistSaving) {
+      return '#38BDF8';
+    }
+    return this.trustedApplications.length === 0 ? '#FBBF24' : '#22C55E';
+  }
+
+  private async persistAppWhitelist(bundleNames: string[]): Promise<void> {
+    if (!this.whitelistEditable()) {
+      return;
+    }
+    this.whitelistSaving = true;
+    this.whitelistError = '';
+    try {
+      this.trustedApplications = await saveTrustedApplications(this.uiAbilityContext(), bundleNames);
+      this.whitelistDetail = this.trustedApplications.length > 0 ?
+        `已选择 ${this.trustedApplications.length} 个应用，仅这些应用会经过 VPN` :
+        '尚未添加应用；空白名单时 Tunnel 不会启动';
+    } catch (error) {
+      const saveError: Error = error as Error;
+      this.whitelistError = `应用白名单保存失败：${saveError.message}`;
+    } finally {
+      this.whitelistSaving = false;
+    }
+  }
+
+  private async requestSetWhitelistApp(bundleName: string, selected: boolean): Promise<void> {
+    if (!this.whitelistEditable()) {
+      return;
+    }
+    const isSelected: boolean = this.trustedApplications.indexOf(bundleName) >= 0;
+    if (selected === isSelected) {
+      return;
+    }
+    const next: string[] = [];
+    for (let index: number = 0; index < this.trustedApplications.length; index++) {
+      if (this.trustedApplications[index] !== bundleName) {
+        next.push(this.trustedApplications[index]);
+      }
+    }
+    if (selected) {
+      next.push(bundleName);
+    }
+    await this.persistAppWhitelist(next);
+  }
+
+  private async loadInstalledApplicationList(): Promise<void> {
+    if (this.applicationListLoading) {
+      return;
+    }
+    const sessionToken: string = bridgeSession.sessionToken;
+    if (sessionToken.length === 0) {
+      if (this.vpnOwnsUsbBridge()) {
+        this.applicationListError = '请先关闭 Tunnel，再读取或修改已安装 APP 列表';
+        return;
+      }
+      this.applicationListError = '正在连接 Mac，以读取已安装 APP…';
+      await bridgeSession.connect();
+      return;
+    }
+    this.applicationListLoading = true;
+    this.applicationListError = '';
+    try {
+      this.installedApplications = await this.installedApplicationSource.load(sessionToken);
+      this.applicationListLoaded = true;
+    } catch (error) {
+      const loadError: Error = error as Error;
+      this.applicationListError = `${loadError.message}。请确认 Mac 端桥接已启动后重试`;
+      if (this.installedApplications.length === 0) {
+        this.applicationListLoaded = false;
+      }
+    } finally {
+      this.applicationListLoading = false;
+    }
+  }
+
+  private visibleInstalledApplications(): InstalledApplication[] {
+    return filterInstalledApplications(this.installedApplications, this.applicationSearch);
+  }
+
+  private unavailableTrustedApplications(): string[] {
+    if (!this.applicationListLoaded) {
+      return [];
+    }
+    const unavailable: string[] = [];
+    for (let trustedIndex: number = 0; trustedIndex < this.trustedApplications.length; trustedIndex++) {
+      const bundleName: string = this.trustedApplications[trustedIndex];
+      let installed: boolean = false;
+      for (let appIndex: number = 0; appIndex < this.installedApplications.length; appIndex++) {
+        if (this.installedApplications[appIndex].bundleName === bundleName) {
+          installed = true;
+          break;
+        }
+      }
+      if (!installed) {
+        unavailable.push(bundleName);
+      }
+    }
+    return unavailable;
   }
 
   private vpnToggleBackground(): string {
@@ -503,6 +685,9 @@ struct Index {
 
   private openSettings(): void {
     this.showSettings = true;
+    if (!this.applicationListLoaded && !this.applicationListLoading) {
+      this.loadInstalledApplicationList();
+    }
   }
 
   private closeSettings(): void {
@@ -768,6 +953,175 @@ struct Index {
         }
         .width('100%')
 
+        Text('应用分流')
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#71839C')
+          .width('100%')
+          .margin({ top: 6 })
+
+        Column({ space: 12 }) {
+          this.CardHeader('APP 白名单', this.whitelistStatusLabel(), this.whitelistStatusColor())
+          Text('仅白名单中的应用流量经过 VPN，其余应用继续使用设备原网络。')
+            .fontSize(14)
+            .fontColor('#B8C6D9')
+            .lineHeight(21)
+            .width('100%')
+
+          if (this.vpnSwitchOn() || this.vpnState === 'STOPPING') {
+            Text('请先关闭 Tunnel，再调整应用白名单。')
+              .fontSize(13)
+              .fontColor('#FBBF24')
+              .lineHeight(19)
+              .width('100%')
+          }
+
+          if (this.whitelistLoaded && this.trustedApplications.length === 0) {
+            Text('当前没有应用会进入 VPN；为防止意外接管全部流量，Tunnel 将保持关闭。')
+              .fontSize(13)
+              .fontColor('#FBBF24')
+              .lineHeight(19)
+              .width('100%')
+          }
+
+          Row({ space: 10 }) {
+            TextInput({ placeholder: '搜索 APP 名称或 Bundle 名称', text: this.applicationSearch })
+              .height(44)
+              .fontSize(13)
+              .fontColor('#F8FAFC')
+              .placeholderColor('#64748B')
+              .backgroundColor('#172337')
+              .layoutWeight(1)
+              .onChange((value: string) => {
+                this.applicationSearch = value;
+              })
+            Button(this.applicationListLoading ? '读取中' : '刷新')
+              .enabled(!this.applicationListLoading)
+              .height(44)
+              .fontSize(13)
+              .fontColor('#FFFFFF')
+              .backgroundColor('#2563EB')
+              .onClick(() => {
+                this.loadInstalledApplicationList();
+              })
+          }
+          .width('100%')
+
+          if (this.applicationListLoading && this.installedApplications.length === 0) {
+            Text('正在通过 USB 读取设备上的已安装 APP…')
+              .fontSize(13)
+              .fontColor('#7DD3FC')
+              .width('100%')
+          }
+
+          if (this.applicationListLoaded) {
+            Text(`${this.visibleInstalledApplications().length} / ${this.installedApplications.length} 个已安装 APP`)
+              .fontSize(12)
+              .fontColor('#71839C')
+              .width('100%')
+          }
+
+          ForEach(this.visibleInstalledApplications(), (application: InstalledApplication) => {
+            Row({ space: 12 }) {
+              Checkbox({ name: application.bundleName, group: 'vpn_app_whitelist' })
+                .select(this.trustedApplications.indexOf(application.bundleName) >= 0)
+                .enabled(this.whitelistEditable())
+                .selectedColor('#2563EB')
+                .width(28)
+                .height(28)
+                .onChange((selected: boolean) => {
+                  this.requestSetWhitelistApp(application.bundleName, selected);
+                })
+
+              Column({ space: 3 }) {
+                Text(applicationDisplayName(application))
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#E2E8F0')
+                  .maxLines(1)
+                  .width('100%')
+                Text(application.bundleName === BUNDLE_NAME ?
+                  `${application.bundleName} · 用于 Tunnel 网络检测` : application.bundleName)
+                  .fontSize(11)
+                  .fontColor('#71839C')
+                  .maxLines(2)
+                  .width('100%')
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .backgroundColor('#172337')
+            .borderRadius(12)
+          }, (application: InstalledApplication) => application.bundleName)
+
+          if (this.applicationListLoaded && this.visibleInstalledApplications().length === 0) {
+            Text('没有匹配的 APP')
+              .fontSize(13)
+              .fontColor('#94A3B8')
+              .width('100%')
+              .padding({ top: 6, bottom: 6 })
+          }
+
+          ForEach(this.unavailableTrustedApplications(), (bundleName: string) => {
+            Row({ space: 12 }) {
+              Column({ space: 3 }) {
+                Text(bundleName)
+                  .fontSize(13)
+                  .fontColor('#CBD5E1')
+                  .maxLines(2)
+                  .width('100%')
+                Text('当前安装列表中已不可用')
+                  .fontSize(11)
+                  .fontColor('#FBBF24')
+                  .width('100%')
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+              Button('移除')
+                .enabled(this.whitelistEditable())
+                .height(34)
+                .fontSize(12)
+                .fontColor('#FCA5A5')
+                .backgroundColor('#3A2028')
+                .onClick(() => {
+                  this.requestSetWhitelistApp(bundleName, false);
+                })
+            }
+            .width('100%')
+            .padding({ left: 12, right: 8, top: 9, bottom: 9 })
+            .backgroundColor('#172337')
+            .borderRadius(12)
+          }, (bundleName: string) => bundleName)
+
+          Text(this.whitelistDetail)
+            .fontSize(12)
+            .fontColor('#71839C')
+            .lineHeight(18)
+            .width('100%')
+
+          if (this.whitelistError.length > 0) {
+            Text(this.whitelistError)
+              .fontSize(13)
+              .fontColor('#FCA5A5')
+              .lineHeight(19)
+              .width('100%')
+          }
+
+          if (this.applicationListError.length > 0) {
+            Text(this.applicationListError)
+              .fontSize(13)
+              .fontColor('#FCA5A5')
+              .lineHeight(19)
+              .width('100%')
+          }
+        }
+        .width('100%')
+        .padding(18)
+        .backgroundColor('#111C2E')
+        .borderRadius(18)
+
         Text('连接与诊断')
           .fontSize(13)
           .fontWeight(FontWeight.Medium)
@@ -816,14 +1170,17 @@ struct Index {
           this.CardHeader('抓包链路', this.proxyEnabled ?
             this.diagnosticStateLabel(this.proxyDiagnosticState) : '未启用',
             this.proxyEnabled ? this.diagnosticStateColor(this.proxyDiagnosticState) : '#94A3B8')
-          Text(this.proxyEnabled ? this.proxyDiagnosticDetail :
+          Text(this.proxyEnabled ?
+            (this.whitelistContainsBridgeApp() ? this.proxyDiagnosticDetail :
+              `将 ${BUNDLE_NAME} 加入白名单后，才可从本应用检测抓包链路。`) :
             'Mac 当前为标准转发模式。运行 harmony-netbridge proxy 后重新开启 Tunnel，即可使用抓包功能。')
             .fontSize(14)
             .fontColor('#B8C6D9')
             .lineHeight(21)
             .width('100%')
           Button('检测 HTTP 抓包')
-            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.proxyDiagnosticState !== 'RUNNING')
+            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.whitelistContainsBridgeApp() &&
+              this.proxyDiagnosticState !== 'RUNNING')
             .backgroundColor('#B45309')
             .fontColor('#FFFFFF')
             .width('100%')
@@ -839,13 +1196,15 @@ struct Index {
         Column({ space: 12 }) {
           this.CardHeader('网络连接检测', this.diagnosticStateLabel(this.diagnosticState),
             this.diagnosticStateColor(this.diagnosticState))
-          Text(this.diagnosticDetail)
+          Text(this.whitelistContainsBridgeApp() ? this.diagnosticDetail :
+            `将 ${BUNDLE_NAME} 加入白名单后，才可从本应用检测 Tunnel 网络。`)
             .fontSize(14)
             .fontColor('#B8C6D9')
             .lineHeight(21)
             .width('100%')
           Button('运行网络检测')
-            .enabled(this.vpnState === 'ACTIVE' && this.diagnosticState !== 'RUNNING')
+            .enabled(this.vpnState === 'ACTIVE' && this.whitelistContainsBridgeApp() &&
+              this.diagnosticState !== 'RUNNING')
             .backgroundColor('#0F766E')
             .fontColor('#FFFFFF')
             .width('100%')
@@ -928,6 +1287,7 @@ struct Index {
             .width('100%')
           this.InfoRow('USB 通道', 'hdc rport + 本机回环连接')
           this.InfoRow('网络协议', 'IPv4 TCP / UDP / DNS')
+          this.InfoRow('流量范围', `${this.trustedApplications.length} 个白名单应用`)
           this.InfoRow('VPN 状态', this.vpnStateLabel())
           this.InfoRow('流量转发', 'gVisor 用户态网络栈')
           this.InfoRow('抓包模式', this.proxyEnabled ? 'mitmweb 已启用' : '未启用')

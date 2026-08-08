@@ -8,6 +8,7 @@ import hnbNative, {
   PacketPumpStatus
 } from 'libhnb.so';
 import { encodeUtf8 } from '../bridge/HnbProtocol';
+import { decodeTrustedApplications } from '../vpn/AppWhitelist';
 import { GateTunnel } from '../vpn/GateTunnel';
 import { reconnectDelay } from '../vpn/ReconnectPolicy';
 import { VpnControlHandshake, VpnControlSession } from '../vpn/VpnControlSession';
@@ -38,6 +39,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
 
   private controlSession: VpnControlSession | undefined = undefined;
   private proxyEnabled: boolean = false;
+  private trustedApplications: string[] = [];
   private pumpStarted: boolean = false;
   private destroyRequested: boolean = false;
   private cleanupPromise: Promise<void> | undefined = undefined;
@@ -52,6 +54,16 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     if (this.mode === 'gate-v') {
       hilog.info(DOMAIN, GATE_TAG, 'GATE_V_START');
       this.runGateV();
+      return;
+    }
+    const encodedWhitelist: string = want.parameters === undefined ||
+      want.parameters['trustedApplications'] === undefined ? '' :
+      want.parameters['trustedApplications'] as string;
+    this.trustedApplications = decodeTrustedApplications(encodedWhitelist);
+    if (this.trustedApplications.length === 0) {
+      VpnRuntimeState.publish('FAILED', '应用白名单为空，已拒绝创建 VPN', false);
+      hilog.warn(DOMAIN, TAG, 'VPN_START_REJECTED empty_app_whitelist');
+      this.stopOwnExtension();
       return;
     }
     this.subscribeToUIStop();
@@ -194,7 +206,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       isIPv4Accepted: true,
       isIPv6Accepted: false,
       isBlocking: false,
-      trustedApplications: [],
+      trustedApplications: this.trustedApplications.slice(),
       blockedApplications: []
     };
     let tunFd: number;
@@ -205,7 +217,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       throw new Error(`VPN create failed: ${createError.code}`);
     }
     this.vpnCreated = true;
-    hilog.info(DOMAIN, TAG, 'PHASE3_VPN_CREATE_OK mtu=%{public}d', handshake.mtu);
+    hilog.info(DOMAIN, TAG, 'PHASE3_VPN_CREATE_OK mtu=%{public}d trusted_apps=%{public}d',
+      handshake.mtu, this.trustedApplications.length);
 
     const startResult: number = hnbNative.startPacketPump(tunFd);
     if (startResult !== 0) {
@@ -213,8 +226,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     }
     this.pumpStarted = true;
     const activeDetail: string = handshake.proxyEnabled ?
-      `HTTP(S) TCP 已接入 Mac 抓包代理；UDP / DNS 直连 · MTU ${handshake.mtu}` :
-      `IPv4 TCP / UDP / DNS 已通过 USB 转发到 Mac · MTU ${handshake.mtu}`;
+      `${this.trustedApplications.length} 个白名单应用已接入 Mac 抓包代理 · MTU ${handshake.mtu}` :
+      `${this.trustedApplications.length} 个白名单应用已通过 USB 转发到 Mac · MTU ${handshake.mtu}`;
     VpnRuntimeState.publish('ACTIVE', activeDetail, handshake.proxyEnabled);
     await controlSession.reportStatus('ACTIVE', 'packet_pump_started');
     hilog.info(DOMAIN, TAG, 'PHASE3_ACTIVE');

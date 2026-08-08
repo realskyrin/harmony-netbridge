@@ -5,10 +5,12 @@ package hdc
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -46,6 +48,13 @@ type Target struct {
 	Connection string
 	Status     string
 	Endpoint   string
+}
+
+// InstalledApplication is one user-selectable application reported by the
+// device Bundle Manager. Label may be empty on older device versions.
+type InstalledApplication struct {
+	BundleName string `json:"bundleName"`
+	Label      string `json:"label"`
 }
 
 // Usable reports whether hdc considers this target ready for commands. Current
@@ -131,6 +140,124 @@ func (m *Manager) ListTargets(ctx context.Context) ([]Target, error) {
 		return nil, fmt.Errorf("list hdc targets: hdc reported a failure")
 	}
 	return ParseTargets(output), nil
+}
+
+// ListInstalledApplications returns the applications installed for the active
+// device user. Newer bm versions can return localized labels as JSON; older
+// versions fall back to the bundle-name list.
+func (m *Manager) ListInstalledApplications(ctx context.Context, targetID string) ([]InstalledApplication, error) {
+	labelOutput, labelErr := m.runner().Run(ctx, m.Path, "-t", targetID, "shell", "bm", "dump", "-a", "-l")
+	if labelErr == nil && !isFailureOutput(labelOutput) {
+		if applications := ParseInstalledApplicationLabels(labelOutput); len(applications) > 0 {
+			return applications, nil
+		}
+	}
+
+	output, err := m.runner().Run(ctx, m.Path, "-t", targetID, "shell", "bm", "dump", "-a")
+	if err != nil {
+		return nil, fmt.Errorf("list installed applications: %w", commandFailure(err, output, targetID))
+	}
+	if isFailureOutput(output) {
+		return nil, fmt.Errorf("list installed applications: hdc reported a failure")
+	}
+	applications := ParseInstalledApplicationNames(output)
+	if len(applications) == 0 {
+		return nil, fmt.Errorf("list installed applications: bm returned no valid applications")
+	}
+	return applications, nil
+}
+
+// ParseInstalledApplicationLabels parses bm dump -a -l JSON output.
+func ParseInstalledApplicationLabels(output string) []InstalledApplication {
+	trimmed := strings.TrimSpace(output)
+	if len(trimmed) == 0 || len(trimmed) > 1024*1024 {
+		return nil
+	}
+	var applications []InstalledApplication
+	if err := json.Unmarshal([]byte(trimmed), &applications); err != nil {
+		return nil
+	}
+	return normalizeInstalledApplications(applications)
+}
+
+// ParseInstalledApplicationNames parses bm dump -a output, including its
+// "ID: <user>:" header, and ignores every line that is not a valid bundle name.
+func ParseInstalledApplicationNames(output string) []InstalledApplication {
+	if len(output) > 1024*1024 {
+		return nil
+	}
+	applications := make([]InstalledApplication, 0)
+	for _, line := range strings.Split(output, "\n") {
+		applications = append(applications, InstalledApplication{BundleName: strings.TrimSpace(line)})
+	}
+	return normalizeInstalledApplications(applications)
+}
+
+func normalizeInstalledApplications(applications []InstalledApplication) []InstalledApplication {
+	normalized := make([]InstalledApplication, 0, len(applications))
+	seen := make(map[string]struct{}, len(applications))
+	for _, application := range applications {
+		bundleName := strings.TrimSpace(application.BundleName)
+		if !isValidBundleName(bundleName) {
+			continue
+		}
+		if _, exists := seen[bundleName]; exists {
+			continue
+		}
+		label := strings.TrimSpace(application.Label)
+		if len(label) > 256 || strings.ContainsAny(label, "\r\n\x00") {
+			label = ""
+		}
+		seen[bundleName] = struct{}{}
+		normalized = append(normalized, InstalledApplication{BundleName: bundleName, Label: label})
+		if len(normalized) == 4096 {
+			break
+		}
+	}
+	sort.Slice(normalized, func(left, right int) bool {
+		leftLabel := normalized[left].Label
+		rightLabel := normalized[right].Label
+		if leftLabel == "" {
+			leftLabel = normalized[left].BundleName
+		}
+		if rightLabel == "" {
+			rightLabel = normalized[right].BundleName
+		}
+		if strings.EqualFold(leftLabel, rightLabel) {
+			return normalized[left].BundleName < normalized[right].BundleName
+		}
+		return strings.ToLower(leftLabel) < strings.ToLower(rightLabel)
+	})
+	return normalized
+}
+
+func isValidBundleName(bundleName string) bool {
+	if len(bundleName) < 7 || len(bundleName) > 128 {
+		return false
+	}
+	segments := strings.Split(bundleName, ".")
+	if len(segments) < 3 {
+		return false
+	}
+	for segmentIndex, segment := range segments {
+		if segment == "" {
+			return false
+		}
+		for characterIndex, character := range []byte(segment) {
+			isLetter := (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')
+			isDigit := character >= '0' && character <= '9'
+			if characterIndex == 0 && (!isLetter && (segmentIndex == 0 || !isDigit)) {
+				return false
+			}
+			if !isLetter && !isDigit && character != '_' {
+				return false
+			}
+			if characterIndex == len(segment)-1 && !isLetter && !isDigit {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ParseTargets parses both verbose hdc rows and the one-column fallback format.
