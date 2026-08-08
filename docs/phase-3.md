@@ -10,6 +10,7 @@ Phase 3 在已通过真机验证的 Phase 2 IPv4 VPN 数据面上补齐单设备
 - Control/Data 两条连接各自维护 HNB sequence、5 秒心跳和 15 秒确认超时。
 - ArkTS Control 20 秒入站 watchdog，以及 Native Data 20 秒阻塞读取上限。
 - 非主动断线后有序停止 PacketPump、销毁旧 VPN，并以 1/2/4/8/10 秒上限退避重建完整会话。
+- Mac daemon 定期核对本实例的精确 `hdc rport`；USB 断开时保持运行，原设备重新上线且映射为空后自动补建，不删除或覆盖其他映射。
 - daemon 非正常退出后，从受保护的状态文件读取并只移除本实例上次记录的精确 hdc 映射，再创建新映射；不会批量清理其他端口。
 - App 停止、CLI `STOP_REQUEST` 与系统销毁是终止事件，不会触发重连。
 - DNS resolver 30 秒常规刷新；旧 resolver 交换失败时立即重新读取 `scutil --dns`；UDP 截断响应自动改用 TCP。
@@ -46,6 +47,7 @@ RECONNECTING
 
 - Go `-race` 全量测试、`go vet` 与 macOS arm64 构建。
 - MTU CLI 边界、HNB `HELLO_ACK.mtu`、Control/Data 心跳、连续 sequence、RTT 状态和重连计数。
+- hdc 空映射识别、精确 Reverse 任务匹配，以及设备离线后同一映射的自动恢复。
 - gVisor TCP/UDP/DNS relay 聚合统计。
 - macOS resolver 故障刷新及 UDP DNS 截断后的 TCP retry。
 - ArkTS MTU 与退避策略测试、Native C++ 双向数据/心跳编译、签名 HAP 打包。
@@ -56,9 +58,10 @@ RECONNECTING
 2. App 启动 VPN，确认 CLI 为 `DATA_CONNECTED / ACTIVE / MTU 1280`。
 3. 等待至少一个周期，确认 Control/Data heartbeat 均有 RTT。
 4. 在 App 运行 UDP DNS 与 TCP DNS 自检，确认 `PASS`，并确认 CLI 聚合计数增长。
-5. 精确终止当前 daemon 进程以模拟崩溃，不发送 `STOP_REQUEST`；App 应进入 `RECONNECTING` 并销毁旧 VPN。
-6. 重新运行同一 MTU 的 daemon；无需再次点击，App 应自动恢复 `DATA_CONNECTED / ACTIVE`，`Reconnects` 增加。
-7. 再次运行网络自检，最后执行 CLI `stop`，确认 App 为 `STOPPED`、VPN 销毁且 hdc 映射移除。
+5. VPN 活动时拔出 USB 数据线，等待 CLI 显示设备离线；重新接线后无需重启 daemon，确认映射与 `DATA_CONNECTED / ACTIVE` 自动恢复。
+6. 精确终止当前 daemon 进程以模拟崩溃，不发送 `STOP_REQUEST`；App 应进入 `RECONNECTING` 并销毁旧 VPN。
+7. 重新运行同一 MTU 的 daemon；无需再次点击，App 应自动恢复 `DATA_CONNECTED / ACTIVE`，`Reconnects` 增加。
+8. 再次运行网络自检，最后执行 CLI `stop`，确认 App 为 `STOPPED`、VPN 销毁且 hdc 映射移除。
 
 ## 本轮真机结果（2026-08-06）
 

@@ -34,26 +34,28 @@ import (
 )
 
 const (
-	DefaultDevicePort        = 27183
-	DefaultMTU               = int(packetrelay.DefaultMTU)
-	MinimumMTU               = 576
-	MaximumMTU               = 1500
-	defaultHandshakeTimeout  = 5 * time.Second
-	defaultHeartbeatInterval = 5 * time.Second
-	defaultHeartbeatTimeout  = 15 * time.Second
-	controlRequestTimeout    = 5 * time.Second
-	controlStopAckTimeout    = 2 * time.Second
-	cleanupTimeout           = 5 * time.Second
-	certificateDownloadPath  = "/mitmproxy-ca-cert.cer"
-	installedAppsPath        = "/installed-apps.json"
-	maxCertificateBytes      = 64 * 1024
-	maxHTTPRequestBytes      = 8 * 1024
-	maxInstalledAppsBytes    = 1024 * 1024
+	DefaultDevicePort           = 27183
+	DefaultMTU                  = int(packetrelay.DefaultMTU)
+	MinimumMTU                  = 576
+	MaximumMTU                  = 1500
+	defaultHandshakeTimeout     = 5 * time.Second
+	defaultHeartbeatInterval    = 5 * time.Second
+	defaultHeartbeatTimeout     = 15 * time.Second
+	defaultMappingCheckInterval = 2 * time.Second
+	controlRequestTimeout       = 5 * time.Second
+	controlStopAckTimeout       = 2 * time.Second
+	cleanupTimeout              = 5 * time.Second
+	certificateDownloadPath     = "/mitmproxy-ca-cert.cer"
+	installedAppsPath           = "/installed-apps.json"
+	maxCertificateBytes         = 64 * 1024
+	maxHTTPRequestBytes         = 8 * 1024
+	maxInstalledAppsBytes       = 1024 * 1024
 )
 
 // Forwarder is the narrow hdc capability owned by the daemon.
 type Forwarder interface {
 	AddReverse(ctx context.Context, targetID string, mapping hdc.Mapping) error
+	HasReverse(ctx context.Context, targetID string, mapping hdc.Mapping) (bool, error)
 	Remove(ctx context.Context, targetID string, mapping hdc.Mapping) error
 }
 
@@ -93,21 +95,22 @@ type ProxyRecovery func(previous state.ProxySnapshot) error
 
 // Config contains all external daemon dependencies.
 type Config struct {
-	Paths             runtimepath.Paths
-	DeviceID          string
-	DeviceLabel       string
-	DevicePort        int
-	MTU               int
-	Forwarder         Forwarder
-	AppLister         AppLister
-	Logger            *slog.Logger
-	Now               func() time.Time
-	HandshakeTimeout  time.Duration
-	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
-	RelayFactory      RelayFactory
-	ProxyFactory      ProxyFactory
-	ProxyRecovery     ProxyRecovery
+	Paths                runtimepath.Paths
+	DeviceID             string
+	DeviceLabel          string
+	DevicePort           int
+	MTU                  int
+	Forwarder            Forwarder
+	AppLister            AppLister
+	Logger               *slog.Logger
+	Now                  func() time.Time
+	HandshakeTimeout     time.Duration
+	HeartbeatInterval    time.Duration
+	HeartbeatTimeout     time.Duration
+	MappingCheckInterval time.Duration
+	RelayFactory         RelayFactory
+	ProxyFactory         ProxyFactory
+	ProxyRecovery        ProxyRecovery
 }
 
 // Server supervises a single selected hdc target.
@@ -134,6 +137,8 @@ type Server struct {
 	deviceListener  net.Listener
 	mapping         hdc.Mapping
 	mappingAdded    bool
+	mappingCancel   context.CancelFunc
+	mappingDone     chan struct{}
 	proxySession    ProxySession
 
 	// These hooks are nil in production and let package tests pause the two
@@ -234,6 +239,9 @@ func New(config Config) (*Server, error) {
 	}
 	if config.HeartbeatTimeout <= config.HeartbeatInterval {
 		config.HeartbeatTimeout = 3 * config.HeartbeatInterval
+	}
+	if config.MappingCheckInterval <= 0 {
+		config.MappingCheckInterval = defaultMappingCheckInterval
 	}
 	return &Server{config: config, stopRequested: make(chan struct{})}, nil
 }
@@ -347,6 +355,7 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 		snapshot.LastError = ""
 	})
 	s.config.Logger.Info("daemon ready", "device", s.config.DeviceLabel, "device_port", s.config.DevicePort, "host_port", hostPort)
+	s.startMappingMonitor(ctx)
 
 	serveErrors := make(chan error, 2)
 	go s.serveControl(serveErrors)
@@ -381,6 +390,130 @@ func (s *Server) Run(ctx context.Context) (runError error) {
 		}
 		return errors.New("local capture proxy stopped unexpectedly")
 	}
+}
+
+func (s *Server) startMappingMonitor(parent context.Context) {
+	monitorContext, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.mappingCancel = cancel
+	s.mappingDone = done
+	s.mu.Unlock()
+	go func() {
+		defer close(done)
+		s.monitorMapping(monitorContext)
+	}()
+}
+
+func (s *Server) monitorMapping(ctx context.Context) {
+	ticker := time.NewTicker(s.config.MappingCheckInterval)
+	defer ticker.Stop()
+	unavailable := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		checkContext, cancelCheck := context.WithTimeout(ctx, cleanupTimeout)
+		present, err := s.config.Forwarder.HasReverse(checkContext, s.config.DeviceID, s.mapping)
+		cancelCheck()
+		if ctx.Err() != nil || s.isStopping() {
+			return
+		}
+		if err != nil {
+			if !unavailable {
+				s.config.Logger.Warn("hdc reverse mapping unavailable; waiting for USB reconnect",
+					"device", s.config.DeviceLabel, "error", err)
+			}
+			unavailable = true
+			s.markMappingUnavailable()
+			continue
+		}
+		if present {
+			if unavailable {
+				s.config.Logger.Info("hdc reverse mapping is available again", "device", s.config.DeviceLabel)
+				s.markMappingAvailable()
+			}
+			unavailable = false
+			continue
+		}
+
+		if !unavailable {
+			s.config.Logger.Warn("hdc dropped the owned reverse mapping; waiting to restore it",
+				"device", s.config.DeviceLabel)
+		}
+		unavailable = true
+		s.markMappingUnavailable()
+		restoreContext, cancelRestore := context.WithTimeout(ctx, cleanupTimeout)
+		err = s.config.Forwarder.AddReverse(restoreContext, s.config.DeviceID, s.mapping)
+		cancelRestore()
+		if ctx.Err() != nil || s.isStopping() {
+			return
+		}
+		if err != nil {
+			continue
+		}
+		unavailable = false
+		s.config.Logger.Info("restored hdc reverse mapping after USB reconnect",
+			"device", s.config.DeviceLabel, "device_port", s.mapping.DevicePort)
+		s.markMappingAvailable()
+	}
+}
+
+func (s *Server) markMappingUnavailable() {
+	s.mu.Lock()
+	stopping := s.stopping
+	controlConnected := s.controlConnection != nil
+	s.mu.Unlock()
+	if stopping || controlConnected || s.store == nil {
+		return
+	}
+	current := s.store.Get()
+	vpnStatus := current.VPN
+	if vpnStatus == state.VPNActive || vpnStatus == state.VPNStarting || vpnStatus == state.VPNAuthRequired {
+		vpnStatus = state.VPNReconnecting
+	}
+	message := "USB bridge unavailable; waiting for the selected Harmony device to reconnect"
+	if current.Transport == state.TransportDeviceOffline && current.VPN == vpnStatus &&
+		current.Message == message && current.LastErrorCode == string(apperror.CodeRPortFailed) {
+		return
+	}
+	s.update(func(snapshot *state.Snapshot) {
+		snapshot.Transport = state.TransportDeviceOffline
+		snapshot.VPN = vpnStatus
+		snapshot.Message = message
+		snapshot.LastErrorCode = string(apperror.CodeRPortFailed)
+		snapshot.LastError = "The hdc reverse mapping is unavailable"
+	})
+}
+
+func (s *Server) markMappingAvailable() {
+	s.mu.Lock()
+	stopping := s.stopping
+	controlConnected := s.controlConnection != nil
+	s.mu.Unlock()
+	if stopping || controlConnected || s.store == nil {
+		return
+	}
+	current := s.store.Get()
+	vpnStatus := current.VPN
+	if vpnStatus == state.VPNActive || vpnStatus == state.VPNStarting || vpnStatus == state.VPNAuthRequired {
+		vpnStatus = state.VPNReconnecting
+	}
+	message := "USB bridge restored; waiting for HarmonyNetBridge App to reconnect"
+	if current.Transport == state.TransportPortReady && current.VPN == vpnStatus &&
+		current.Message == message && current.LastErrorCode == "" {
+		return
+	}
+	s.update(func(snapshot *state.Snapshot) {
+		snapshot.Transport = state.TransportPortReady
+		snapshot.VPN = vpnStatus
+		snapshot.Message = message
+		snapshot.LastErrorCode = ""
+		snapshot.LastError = ""
+	})
 }
 
 func (s *Server) serveControl(errorsChannel chan<- error) {
@@ -1149,6 +1282,8 @@ func (s *Server) shutdown() error {
 	dataConnection := s.dataConnection
 	dataRelay := s.dataRelay
 	proxySession := s.proxySession
+	mappingCancel := s.mappingCancel
+	mappingDone := s.mappingDone
 	s.controlConnection = nil
 	s.controlWriter = nil
 	s.controlMode = ""
@@ -1158,7 +1293,15 @@ func (s *Server) shutdown() error {
 	s.dataWriter = nil
 	s.dataRelay = nil
 	s.proxySession = nil
+	s.mappingCancel = nil
+	s.mappingDone = nil
 	s.mu.Unlock()
+	if mappingCancel != nil {
+		mappingCancel()
+	}
+	if mappingDone != nil {
+		<-mappingDone
+	}
 
 	if s.store != nil {
 		s.update(func(snapshot *state.Snapshot) {

@@ -150,6 +150,55 @@ func TestManagerOwnsExactReverseMapping(t *testing.T) {
 	}
 }
 
+func TestManagerFindsOnlyExactReverseMapping(t *testing.T) {
+	t.Parallel()
+	runner := &recordingRunner{outputs: []string{
+		strings.Join([]string{
+			"secret-device-id tcp:27183 tcp:54320 [Reverse]",
+			"secret-device-id tcp:27183 tcp:54321 [Forward]",
+			"another-device-id tcp:27183 tcp:54321 [Reverse]",
+			"secret-device-id tcp:27183 tcp:54321 [Reverse]",
+		}, "\n"),
+		"[Empty]",
+	}}
+	manager := &Manager{Path: "/test/hdc", Runner: runner}
+	mapping := Mapping{DevicePort: 27183, HostPort: 54321}
+	present, err := manager.HasReverse(context.Background(), "secret-device-id", mapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Fatal("HasReverse() = false, want exact reverse mapping")
+	}
+	present, err = manager.HasReverse(context.Background(), "secret-device-id", mapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("HasReverse() = true for an empty mapping list")
+	}
+	want := [][]string{
+		{"-t", "secret-device-id", "fport", "ls"},
+		{"-t", "secret-device-id", "fport", "ls"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestHasReverseRedactsTargetInError(t *testing.T) {
+	t.Parallel()
+	runner := &recordingRunner{outputs: []string{"[Fail] secret-device-id is disconnected"}}
+	manager := &Manager{Path: "/test/hdc", Runner: runner}
+	_, err := manager.HasReverse(context.Background(), "secret-device-id", Mapping{DevicePort: 27183, HostPort: 54321})
+	if err == nil {
+		t.Fatal("HasReverse returned nil error")
+	}
+	if strings.Contains(err.Error(), "secret-device-id") {
+		t.Fatalf("error leaked target ID: %v", err)
+	}
+}
+
 func TestManagerRejectsFailureTextEvenWithZeroExitStatus(t *testing.T) {
 	t.Parallel()
 	manager := &Manager{

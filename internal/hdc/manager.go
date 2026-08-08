@@ -355,6 +355,42 @@ func (m *Manager) AddReverse(ctx context.Context, targetID string, mapping Mappi
 	return nil
 }
 
+// HasReverse reports whether the selected target still owns the exact reverse
+// mapping created by HarmonyNetBridge. hdc drops reverse tasks when a USB
+// transport disappears, even though the Mac daemon and its listener remain
+// alive, so callers must be able to distinguish that case from an existing
+// mapping owned by another process.
+func (m *Manager) HasReverse(ctx context.Context, targetID string, mapping Mapping) (bool, error) {
+	if err := validateMapping(mapping); err != nil {
+		return false, err
+	}
+	output, err := m.runner().Run(ctx, m.Path, "-t", targetID, "fport", "ls")
+	if err != nil || isFailureOutput(output) {
+		return false, apperror.Wrap(
+			apperror.CodeRPortFailed,
+			"hdc could not inspect the reverse port mapping",
+			commandFailure(err, output, targetID),
+		)
+	}
+	return hasExactReverseMapping(output, targetID, mapping), nil
+}
+
+func hasExactReverseMapping(output, targetID string, mapping Mapping) bool {
+	deviceNode := "tcp:" + strconv.Itoa(mapping.DevicePort)
+	hostNode := "tcp:" + strconv.Itoa(mapping.HostPort)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] != targetID || fields[1] != deviceNode || fields[2] != hostNode {
+			continue
+		}
+		direction := strings.Trim(fields[len(fields)-1], "[]")
+		if strings.EqualFold(direction, "reverse") {
+			return true
+		}
+	}
+	return false
+}
+
 // Remove removes the exact forward/reverse mapping tuple owned by this process.
 func (m *Manager) Remove(ctx context.Context, targetID string, mapping Mapping) error {
 	if err := validateMapping(mapping); err != nil {
@@ -403,8 +439,16 @@ func sanitizeOutput(output, targetID string) string {
 func isFailureOutput(output string) bool {
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[Fail]") || (strings.HasPrefix(trimmed, "[E") && strings.Contains(trimmed, "]")) {
+		if strings.HasPrefix(trimmed, "[Fail]") {
 			return true
+		}
+		if strings.HasPrefix(trimmed, "[E") {
+			closingBracket := strings.IndexByte(trimmed, ']')
+			if closingBracket > 2 {
+				if _, err := strconv.ParseUint(trimmed[2:closingBracket], 10, 64); err == nil {
+					return true
+				}
+			}
 		}
 	}
 	return false

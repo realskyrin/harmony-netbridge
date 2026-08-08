@@ -35,10 +35,12 @@ import (
 )
 
 type fakeForwarder struct {
-	added     chan hdc.Mapping
-	mu        sync.Mutex
-	removed   []hdc.Mapping
-	removeErr error
+	added          chan hdc.Mapping
+	mu             sync.Mutex
+	removed        []hdc.Mapping
+	removeErr      error
+	mappingPresent bool
+	inspectErr     error
 }
 
 type fakeAppLister struct {
@@ -116,14 +118,26 @@ func (r *fakePacketRelay) Close() error {
 }
 
 func (f *fakeForwarder) AddReverse(_ context.Context, _ string, mapping hdc.Mapping) error {
+	f.mu.Lock()
+	f.mappingPresent = true
+	f.mu.Unlock()
 	f.added <- mapping
 	return nil
+}
+
+func (f *fakeForwarder) HasReverse(_ context.Context, _ string, _ hdc.Mapping) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mappingPresent, f.inspectErr
 }
 
 func (f *fakeForwarder) Remove(_ context.Context, _ string, mapping hdc.Mapping) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, mapping)
+	if f.removeErr == nil {
+		f.mappingPresent = false
+	}
 	return f.removeErr
 }
 
@@ -1090,6 +1104,82 @@ func TestServerAcceptsSingleDeviceReconnectAfterUnexpectedLoss(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("daemon did not stop")
+	}
+}
+
+func TestServerRestoresReverseMappingAfterUSBReconnect(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "hnb-daemon-usb-reconnect-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths, err := runtimepath.FromRoots(filepath.Join(root, "runtime"), filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := &fakeForwarder{added: make(chan hdc.Mapping, 2)}
+	server, err := New(Config{
+		Paths: paths, DeviceID: "secret-device-id", DeviceLabel: "device-redacted", Forwarder: forwarder,
+		MappingCheckInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runContext, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(runContext) }()
+	var mapping hdc.Mapping
+	select {
+	case mapping = <-forwarder.added:
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not create its initial reverse mapping")
+	}
+
+	forwarder.mu.Lock()
+	forwarder.mappingPresent = false
+	forwarder.inspectErr = errors.New("fixture device disconnected")
+	forwarder.mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for server.store.Get().Transport != state.TransportDeviceOffline {
+		if time.Now().After(deadline) {
+			t.Fatalf("mapping loss was not reflected in state: %#v", server.store.Get())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	forwarder.mu.Lock()
+	forwarder.inspectErr = nil
+	forwarder.mu.Unlock()
+	select {
+	case restored := <-forwarder.added:
+		if restored != mapping {
+			t.Fatalf("restored mapping = %#v, want %#v", restored, mapping)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not restore the reverse mapping after reconnect")
+	}
+	deadline = time.Now().Add(time.Second)
+	for server.store.Get().Transport != state.TransportPortReady {
+		if time.Now().After(deadline) {
+			t.Fatalf("restored mapping was not reflected in state: %#v", server.store.Get())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case runError := <-runResult:
+		if runError != nil {
+			t.Fatal(runError)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+	forwarder.mu.Lock()
+	defer forwarder.mu.Unlock()
+	if len(forwarder.removed) != 1 || forwarder.removed[0] != mapping {
+		t.Fatalf("removed mappings = %#v, want only %#v", forwarder.removed, mapping)
 	}
 }
 

@@ -19,6 +19,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - Native C++ `PacketPump` 独占 TUN fd 与 Data socket，支持双向 raw IPv4 packet。
 - Control 与 Data 各自每 5 秒发送 HNB 心跳；连续 15 秒未收到对应响应即关闭失效会话，避免保留黑洞默认路由。
 - 设备在非主动中断后先停止 PacketPump、销毁旧 VPN，再以 1/2/4/8/10 秒上限退避重建整个会话；App 或 CLI 主动停止不会触发重连。
+- daemon 持续核对自己创建的精确 `hdc rport`；USB 数据线拔出导致映射丢失后，设备重新上线会自动补建同一映射，不必重启 Mac daemon。
 - daemon 非正常退出后会依据受保护状态文件，只回收本实例上次记录的精确 hdc 映射并恢复服务，不批量删除其他转发规则。
 - Mac gVisor relay 支持 TCP、UDP 和 DNS-over-UDP / DNS-over-TCP。
 - DNS 虚拟地址 `198.18.0.1`；Mac 端读取 `scutil --dns`，按最长域名后缀选择企业 split-DNS resolver。resolver 失败时立即刷新配置，UDP 截断响应自动改用 TCP，不静默回退公共 DNS。
