@@ -1,5 +1,10 @@
 import { http } from '@kit.NetworkKit';
-import { isValidBundleName, normalizeBundleName } from './AppWhitelist';
+import {
+  ALWAYS_TUNNELED_BUNDLE_NAME,
+  isValidBundleName,
+  normalizeBundleName,
+  normalizeSelectedApplications
+} from './AppWhitelist';
 
 const INSTALLED_APPLICATIONS_URL: string = 'http://127.0.0.1:27183/installed-apps.json';
 const TIMEOUT_MS: number = 5000;
@@ -42,7 +47,8 @@ export function decodeInstalledApplications(encoded: string): InstalledApplicati
       }
       const bundleName: string = normalizeBundleName(candidate.bundleName);
       const label: string = candidate.label.trim();
-      if (!isValidBundleName(bundleName) || label.length > MAX_LABEL_LENGTH ||
+      if (!isValidBundleName(bundleName) || bundleName === ALWAYS_TUNNELED_BUNDLE_NAME ||
+        label.length > MAX_LABEL_LENGTH ||
         seenBundleNames.indexOf(bundleName) >= 0) {
         continue;
       }
@@ -77,6 +83,25 @@ export function filterInstalledApplications(applications: InstalledApplication[]
     }
   }
   return filtered;
+}
+
+export function prioritizeSelectedApplications(applications: InstalledApplication[],
+  selectedBundleNames: string[]): InstalledApplication[] {
+  const selectedBundleNamesNormalized: string[] = normalizeSelectedApplications(selectedBundleNames);
+  const selected: InstalledApplication[] = [];
+  const unselected: InstalledApplication[] = [];
+  for (let index: number = 0; index < applications.length; index++) {
+    const application: InstalledApplication = applications[index];
+    if (selectedBundleNamesNormalized.indexOf(application.bundleName) >= 0) {
+      selected.push(application);
+    } else {
+      unselected.push(application);
+    }
+  }
+  for (let index: number = 0; index < unselected.length; index++) {
+    selected.push(unselected[index]);
+  }
+  return selected;
 }
 
 export class InstalledApplicationSource {

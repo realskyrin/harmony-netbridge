@@ -2,7 +2,7 @@
 
 HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥。它不依赖 Android API，让鸿蒙设备通过 USB 与 `hdc` 复用 Mac 当前的网络路由，包括企业 Wi-Fi、Cisco AnyConnect 等开发环境。
 
-当前仓库已实现 **Phase 4 单设备开发版**：HarmonyOS `VpnExtensionAbility` 只接管用户白名单中的 App，并为这些 App 配置默认 IPv4 路由；Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS。`proxy` 模式还会安全托管一个 loopback-only mitmweb，把白名单 App 的常见 HTTP/HTTPS TCP 流量接入抓包链路。
+当前仓库已实现 **Phase 4 单设备开发版**：HarmonyOS `VpnExtensionAbility` 支持按白名单或黑名单接管 App，并为实际进入 Tunnel 的 App 配置默认 IPv4 路由；Mac 端通过 gVisor Netstack 复用当前网络与企业 split DNS。`proxy` 模式还会安全托管一个 loopback-only mitmweb，把已分流 App 的常见 HTTP/HTTPS TCP 流量接入抓包链路。
 
 ## 当前能力
 
@@ -14,7 +14,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - 抓包模式拦截 TCP 80/443/8080/8443；UDP/443 被拒绝以促使 QUIC 回退 TCP，其他 UDP、DNS 和非 HTTP TCP 仍按标准模式转发。
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
 - HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
-- App 设置页从当前设备的已安装 APP 列表中搜索、勾选并持久化 VPN 白名单，再把对应 Bundle 名称写入 `VpnConfig.trustedApplications`；未选中的 App 保持设备原网络，空白名单时拒绝启动 Tunnel。
+- App 设置页通过 Tab 切换白名单或黑名单模式，APP 分流卡片只展示已选 APP；点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表。HarmonyNetBridge 自身不显示在名单中并始终进入 Tunnel。两种模式共用同一份选中结果：白名单把本应用和选中 Bundle 写入 `VpnConfig.trustedApplications`，黑名单把选中 Bundle 写入 `blockedApplications`，且始终排除本应用。
 - `start --mtu 576...1500`：由 Mac 在握手中下发 MTU，设备 VPN 与 gVisor relay 使用同一值，默认 1400。
 - Native C++ `PacketPump` 独占 TUN fd 与 Data socket，支持双向 raw IPv4 packet。
 - Control 与 Data 各自每 5 秒发送 HNB 心跳；连续 15 秒未收到对应响应即关闭失效会话，避免保留黑洞默认路由。
@@ -31,7 +31,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 ## 架构
 
 ```text
-HarmonyOS NEXT whitelisted Apps IPv4 traffic
+HarmonyOS NEXT routed Apps IPv4 traffic
                     │
                     ▼
           VpnExtensionAbility
@@ -95,6 +95,14 @@ HarmonyOS App：
 
 未配置签名时会生成 `entry-default-unsigned.hap`；配置个人调试签名后会生成并优先报告 `entry-default-signed.hap`。真机必须安装与你设备匹配的签名 HAP。签名证书、密码和本机路径属于开发者本地配置，不应作为项目发布凭据共享。
 
+构建、安装并打开 App 供真机检查：
+
+```bash
+./scripts/run-ohos-app.sh
+```
+
+只有一台在线设备时脚本会自动选择；检测到多台设备时只列出统一的 1-based 序号并停止，使用 `./scripts/run-ohos-app.sh --device <序号>` 显式选择。可通过 `HNB_HDC` 覆盖 `hdc` 路径，也可通过 `HNB_DEVICE` 提供已明确选择的设备序号或 target。
+
 ## 真机使用
 
 1. 连接并解锁手机，确认只有一个设备处于 `Connected` 状态。
@@ -105,7 +113,7 @@ HarmonyOS App：
    ./bin/harmony-netbridge --mtu 1400 start
    ```
 
-3. 打开 HarmonyNetBridge App，进入“设置 → APP 白名单”，在已安装 APP 列表中搜索并勾选需要分流的应用，然后开启 VPN Tunnel。首次使用时确认 HarmonyOS 的 VPN 授权提示。
+3. 打开 HarmonyNetBridge App，进入“设置 → APP 分流”，选择白名单或黑名单模式，点击“名单管理”，在 Bottom Sheet 中搜索并勾选应用，然后开启 VPN Tunnel。首次使用时确认 HarmonyOS 的 VPN 授权提示。
 4. 查看 Mac 状态：
 
    ```bash
@@ -123,7 +131,7 @@ HarmonyOS App：
    Message:   IPv4 TCP, UDP, and DNS relay is active
    ```
 
-5. 若要运行 App 内置网络/抓包自检，还需把 `io.github.realskyrin.harmonynetbridge` 自身加入白名单；否则自检按钮会保持禁用，避免把直连结果误判为 VPN 数据面结果。`PASS` 表示 UDP DNS 和 TCP DNS 都已通过真实 VPN 数据面返回。
+5. HarmonyNetBridge 自身不出现在名单中，并会在白名单和黑名单模式下始终进入 Tunnel，因此可直接运行 App 内置网络/抓包自检。`PASS` 表示 UDP DNS 和 TCP DNS 都已通过真实 VPN 数据面返回。
 6. 停止时运行：
 
    ```bash
@@ -132,13 +140,13 @@ HarmonyOS App：
 
    daemon 会先向 App 发送 `STOP_REQUEST`；设备停止 PacketPump、销毁 VPN 后，Mac 只删除本实例创建的精确 hdc 映射。
 
-### APP 白名单分流
+### APP 白名单与黑名单分流
 
-- 设置页通过当前 HNB 控制会话，从 Mac daemon 读取设备上的已安装 APP 名称与 Bundle 名称；用户通过搜索和勾选维护白名单，无需手工填写 Bundle ID。
+- APP 分流卡片始终只展示已选 APP，不在设置页平铺完整安装列表；点击“名单管理”后，二级 Bottom Sheet 才展示搜索、刷新和完整已安装 APP 列表，其中已选 APP 自动排在未选 APP 前面。HarmonyNetBridge 自身会从已安装列表和历史选中结果中移除，并作为隐式规则始终进入 Tunnel。白名单与黑名单 Tab 共用同一份选中结果，切换模式不会复制、清空或替换已选 APP。
 - daemon 优先执行只读 `hdc shell bm dump -a -l` 获取本地化 APP 名称和 Bundle 名称；设备版本不支持标签输出时回退到 `bm dump -a`。列表请求必须携带当前控制会话的随机 token，连接断开后立即失效。
-- Tunnel 创建时只把已保存的 Bundle 名称传给 HarmonyOS `VpnConfig.trustedApplications`，`blockedApplications` 保持为空。
-- 空白名单采用 fail-closed：UI 与 VPN Extension 都会拒绝创建 Tunnel，不会把空数组解释成“接管全部 App”。
-- Tunnel 活动期间不能修改白名单；先关闭 Tunnel，修改后再次开启即可使用新配置。
+- 白名单模式让本应用和选中 APP 进入 Tunnel，对应 Bundle 写入 `VpnConfig.trustedApplications`；黑名单模式让选中 APP 保持直连，其余 APP 进入 Tunnel，对应 Bundle 写入 `blockedApplications`，本应用不会被写入黑名单。两种模式不会同时下发非空列表。
+- 白名单为空时仍可创建 Tunnel，但只接管作为隐式白名单成员的 HarmonyNetBridge；黑名单为空表示不排除任何 APP，因此所有 APP 都会进入 Tunnel。
+- 默认和旧版本迁移结果均为白名单模式，原有已选 APP 保持不变。Tunnel 活动期间不能修改模式或列表；先关闭 Tunnel，修改后再次开启即可使用新配置。
 - 普通三方手机应用无权直接枚举完整已安装 APP 列表，因此 App 不申请系统级包管理权限；枚举动作由已选设备对应的本机 hdc 完成。
 
 ### 抓包模式

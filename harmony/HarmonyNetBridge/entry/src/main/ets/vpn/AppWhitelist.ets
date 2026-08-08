@@ -1,10 +1,40 @@
 import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 
+// Keep the original preferences namespace and selection key so existing users
+// retain their user-managed selections. The host App is migrated out because
+// it is now an implicit member of every VPN routing configuration.
 const PREFERENCES_NAME: string = 'vpn_app_whitelist';
-const TRUSTED_APPLICATIONS_KEY: string = 'trusted_applications';
+const SELECTED_APPLICATIONS_KEY: string = 'trusted_applications';
+const ROUTING_MODE_KEY: string = 'routing_mode';
 const MIN_BUNDLE_NAME_LENGTH: number = 7;
 const MAX_BUNDLE_NAME_LENGTH: number = 128;
+export const ALWAYS_TUNNELED_BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
+
+export enum AppRoutingMode {
+  WHITELIST = 'whitelist',
+  BLACKLIST = 'blacklist'
+}
+
+export class AppRoutingPreferences {
+  readonly mode: AppRoutingMode;
+  readonly selectedApplications: string[];
+
+  constructor(mode: AppRoutingMode, selectedApplications: string[]) {
+    this.mode = mode;
+    this.selectedApplications = selectedApplications;
+  }
+}
+
+export class VpnApplicationRouting {
+  readonly trustedApplications: string[];
+  readonly blockedApplications: string[];
+
+  constructor(trustedApplications: string[], blockedApplications: string[]) {
+    this.trustedApplications = trustedApplications;
+    this.blockedApplications = blockedApplications;
+  }
+}
 
 function isAsciiLetter(code: number): boolean {
   return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
@@ -59,50 +89,121 @@ export function isValidBundleName(bundleName: string): boolean {
   return true;
 }
 
-export function normalizeTrustedApplications(bundleNames: string[]): string[] {
+export function normalizeSelectedApplications(bundleNames: string[]): string[] {
   const normalized: string[] = [];
   for (let index: number = 0; index < bundleNames.length; index++) {
+    if (typeof bundleNames[index] !== 'string') {
+      continue;
+    }
     const bundleName: string = normalizeBundleName(bundleNames[index]);
-    if (isValidBundleName(bundleName) && normalized.indexOf(bundleName) < 0) {
+    if (isValidBundleName(bundleName) && bundleName !== ALWAYS_TUNNELED_BUNDLE_NAME &&
+      normalized.indexOf(bundleName) < 0) {
       normalized.push(bundleName);
     }
   }
   return normalized;
 }
 
-export function decodeTrustedApplications(encoded: string): string[] {
+export function decodeSelectedApplications(encoded: string): string[] {
   try {
     const decoded: string[] = JSON.parse(encoded) as string[];
     if (!Array.isArray(decoded)) {
       return [];
     }
-    return normalizeTrustedApplications(decoded);
+    return normalizeSelectedApplications(decoded);
   } catch (error) {
     return [];
   }
 }
 
-export async function loadTrustedApplications(context: common.UIAbilityContext): Promise<string[]> {
+export function decodeAppRoutingMode(encoded: string): AppRoutingMode {
+  return encoded === AppRoutingMode.BLACKLIST ? AppRoutingMode.BLACKLIST : AppRoutingMode.WHITELIST;
+}
+
+export function applicationUsesTunnel(mode: AppRoutingMode, selectedApplications: string[],
+  bundleName: string): boolean {
+  const normalizedBundleName: string = normalizeBundleName(bundleName);
+  if (normalizedBundleName === ALWAYS_TUNNELED_BUNDLE_NAME) {
+    return true;
+  }
+  const selected: boolean = normalizeSelectedApplications(selectedApplications).indexOf(normalizedBundleName) >= 0;
+  return mode === AppRoutingMode.WHITELIST ? selected : !selected;
+}
+
+export function buildVpnApplicationRouting(mode: AppRoutingMode,
+  selectedApplications: string[]): VpnApplicationRouting {
+  const normalized: string[] = normalizeSelectedApplications(selectedApplications);
+  if (mode === AppRoutingMode.BLACKLIST) {
+    return new VpnApplicationRouting([], normalized);
+  }
+  const trustedApplications: string[] = [ALWAYS_TUNNELED_BUNDLE_NAME];
+  for (let index: number = 0; index < normalized.length; index++) {
+    trustedApplications.push(normalized[index]);
+  }
+  return new VpnApplicationRouting(trustedApplications, []);
+}
+
+export function canStartAppRouting(mode: AppRoutingMode, selectedApplications: string[]): boolean {
+  if (mode === AppRoutingMode.BLACKLIST) {
+    return true;
+  }
+  return buildVpnApplicationRouting(mode, selectedApplications).trustedApplications.length > 0;
+}
+
+function sameApplicationSelection(stored: string[], normalized: string[]): boolean {
+  if (stored.length !== normalized.length) {
+    return false;
+  }
+  for (let index: number = 0; index < stored.length; index++) {
+    if (typeof stored[index] !== 'string' || stored[index] !== normalized[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function loadAppRoutingPreferences(context: common.UIAbilityContext): Promise<AppRoutingPreferences> {
   try {
     const store: preferences.Preferences = await preferences.getPreferences(context, PREFERENCES_NAME);
-    const stored: preferences.ValueType = await store.get(TRUSTED_APPLICATIONS_KEY, []);
-    return normalizeTrustedApplications(stored as string[]);
+    const storedApplications: preferences.ValueType = await store.get(SELECTED_APPLICATIONS_KEY, []);
+    const storedMode: preferences.ValueType = await store.get(ROUTING_MODE_KEY, AppRoutingMode.WHITELIST);
+    const storedSelection: string[] = Array.isArray(storedApplications) ? storedApplications as string[] : [];
+    const selectedApplications: string[] = normalizeSelectedApplications(storedSelection);
+    if (!sameApplicationSelection(storedSelection, selectedApplications)) {
+      await store.put(SELECTED_APPLICATIONS_KEY, selectedApplications);
+      await store.flush();
+    }
+    return new AppRoutingPreferences(decodeAppRoutingMode(storedMode as string), selectedApplications);
   } catch (error) {
     const preferencesError: Error = error as Error;
-    throw new Error(`read whitelist preferences failed: ${preferencesError.message}`);
+    throw new Error(`read app routing preferences failed: ${preferencesError.message}`);
   }
 }
 
-export async function saveTrustedApplications(context: common.UIAbilityContext,
+export async function saveSelectedApplications(context: common.UIAbilityContext,
   bundleNames: string[]): Promise<string[]> {
-  const normalized: string[] = normalizeTrustedApplications(bundleNames);
+  const normalized: string[] = normalizeSelectedApplications(bundleNames);
   try {
     const store: preferences.Preferences = await preferences.getPreferences(context, PREFERENCES_NAME);
-    await store.put(TRUSTED_APPLICATIONS_KEY, normalized);
+    await store.put(SELECTED_APPLICATIONS_KEY, normalized);
     await store.flush();
     return normalized;
   } catch (error) {
     const preferencesError: Error = error as Error;
-    throw new Error(`write whitelist preferences failed: ${preferencesError.message}`);
+    throw new Error(`write app routing preferences failed: ${preferencesError.message}`);
+  }
+}
+
+export async function saveAppRoutingMode(context: common.UIAbilityContext,
+  mode: AppRoutingMode): Promise<AppRoutingMode> {
+  const normalized: AppRoutingMode = decodeAppRoutingMode(mode);
+  try {
+    const store: preferences.Preferences = await preferences.getPreferences(context, PREFERENCES_NAME);
+    await store.put(ROUTING_MODE_KEY, normalized);
+    await store.flush();
+    return normalized;
+  } catch (error) {
+    const preferencesError: Error = error as Error;
+    throw new Error(`write app routing mode failed: ${preferencesError.message}`);
   }
 }

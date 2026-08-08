@@ -7,21 +7,27 @@ import {
   bridgeSession
 } from '../bridge/BridgeSession';
 import {
-  loadTrustedApplications,
-  saveTrustedApplications
+  ALWAYS_TUNNELED_BUNDLE_NAME,
+  AppRoutingMode,
+  AppRoutingPreferences,
+  canStartAppRouting,
+  loadAppRoutingPreferences,
+  saveAppRoutingMode,
+  saveSelectedApplications
 } from '../vpn/AppWhitelist';
 import {
   applicationDisplayName,
   filterInstalledApplications,
   InstalledApplication,
-  InstalledApplicationSource
+  InstalledApplicationSource,
+  prioritizeSelectedApplications
 } from '../vpn/InstalledApplications';
 import { VpnDiagnosticResult, VpnNetworkDiagnostics } from '../vpn/VpnNetworkDiagnostics';
 import { ProxyCertificate } from '../vpn/ProxyCertificate';
 import { ProxyDiagnostics } from '../vpn/ProxyDiagnostics';
 import { VPN_STATUS_EVENT, VpnRuntimeSnapshot, VpnRuntimeState } from '../vpn/VpnRuntimeState';
 
-const BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
+const BUNDLE_NAME: string = ALWAYS_TUNNELED_BUNDLE_NAME;
 const EXTENSION_NAME: string = 'HarmonyNetBridgeVpnExtensionAbility';
 const SETTINGS_BUNDLE_NAME: string = 'com.huawei.hmos.settings';
 const SETTINGS_ABILITY_NAME: string = 'com.huawei.hmos.settings.MainAbility';
@@ -45,20 +51,23 @@ struct Index {
   @State certificateState: string = 'NOT_DOWNLOADED';
   @State certificateDetail: string = '证书仅通过 USB 从当前 Mac 下载，不会访问外部证书站点';
   @State certificateDownloaded: boolean = false;
-  @State trustedApplications: string[] = [];
-  @State whitelistLoaded: boolean = false;
-  @State whitelistSaving: boolean = false;
-  @State whitelistDetail: string = '正在读取应用白名单';
-  @State whitelistError: string = '';
+  @State selectedApplications: string[] = [];
+  @State appRoutingMode: AppRoutingMode = AppRoutingMode.WHITELIST;
+  @State appRoutingLoaded: boolean = false;
+  @State appRoutingSaving: boolean = false;
+  @State appRoutingDetail: string = '正在读取 APP 分流设置';
+  @State appRoutingError: string = '';
   @State installedApplications: InstalledApplication[] = [];
   @State applicationSearch: string = '';
   @State applicationListLoaded: boolean = false;
   @State applicationListLoading: boolean = false;
   @State applicationListError: string = '';
+  @State showAppPicker: boolean = false;
   @State showSettings: boolean = false;
   @State developerOptionsError: string = '';
   private proxyCertificate: ProxyCertificate = new ProxyCertificate();
   private installedApplicationSource: InstalledApplicationSource = new InstalledApplicationSource();
+  private appPickerScroller: Scroller = new Scroller();
   private vpnStatusTimer: number = -1;
   private vpnStatusSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
 
@@ -79,7 +88,7 @@ struct Index {
     this.subscribeVpnStatus();
     this.refreshVpnStatus();
     this.refreshCertificateStatus();
-    this.loadAppWhitelist();
+    this.loadAppRouting();
     this.vpnStatusTimer = setInterval(() => {
       this.refreshVpnStatus();
     }, 500);
@@ -162,9 +171,6 @@ struct Index {
     if (this.connectionState === BridgeConnectionState.CONNECTED) {
       return 'Mac 服务已就绪';
     }
-    if (this.whitelistLoaded && this.trustedApplications.length === 0) {
-      return '先选择需要分流的应用';
-    }
     return '通过 USB 使用 Mac 网络';
   }
 
@@ -179,17 +185,20 @@ struct Index {
       return '正在释放网络通道，请稍候';
     }
     if (this.vpnState === 'ACTIVE') {
-      return this.proxyEnabled ?
-        `白名单中的 ${this.trustedApplications.length} 个应用正通过 USB 转发到 Mac，并启用 HTTP(S) 抓包` :
-        `白名单中的 ${this.trustedApplications.length} 个应用正使用 Mac 网络，其余应用保持直连`;
+      return this.activeAppRoutingDetail();
     }
     if (this.vpnState === 'FAILED') {
       return this.vpnDetail;
     }
     if (this.connectionState === BridgeConnectionState.CONNECTED) {
-      return this.trustedApplications.length > 0 ?
-        '开启 VPN Tunnel 后，仅白名单应用会切换到 Mac 网络' :
-        '请先在设置中添加需要通过 Tunnel 的应用';
+      if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+        return this.selectedApplications.length === 0 ?
+          '开启 VPN Tunnel 后，所有应用都会切换到 Mac 网络' :
+          '开启 VPN Tunnel 后，除黑名单应用外的其余应用会切换到 Mac 网络';
+      }
+      return this.selectedApplications.length > 0 ?
+        '开启 VPN Tunnel 后，本应用及白名单应用会切换到 Mac 网络' :
+        '开启 VPN Tunnel 后，仅本应用会切换到 Mac 网络';
     }
     return '请先在 Mac 启动 HarmonyNetBridge 服务，然后开启 VPN Tunnel';
   }
@@ -222,9 +231,9 @@ struct Index {
   }
 
   private async requestVpnStart(): Promise<void> {
-    if (!this.whitelistLoaded || this.trustedApplications.length === 0) {
-      this.whitelistError = this.whitelistLoaded ?
-        '请至少添加一个应用后再开启 Tunnel' : '应用白名单尚未加载完成，请稍候重试';
+    if (!this.appRoutingLoaded || !canStartAppRouting(this.appRoutingMode, this.selectedApplications)) {
+      this.appRoutingError = this.appRoutingLoaded ?
+        'APP 分流配置无效，请重新打开应用后重试' : 'APP 分流设置尚未加载完成，请稍候重试';
       this.showSettings = true;
       return;
     }
@@ -237,7 +246,8 @@ struct Index {
         abilityName: EXTENSION_NAME,
         parameters: {
           mode: 'vpn',
-          trustedApplications: JSON.stringify(this.trustedApplications)
+          routingMode: this.appRoutingMode,
+          selectedApplications: JSON.stringify(this.selectedApplications)
         }
       });
     } catch (error) {
@@ -286,8 +296,7 @@ struct Index {
   }
 
   private async requestNetworkDiagnostics(): Promise<void> {
-    if (this.vpnState !== 'ACTIVE' || !this.whitelistContainsBridgeApp() ||
-      this.diagnosticState === 'RUNNING') {
+    if (this.vpnState !== 'ACTIVE' || this.diagnosticState === 'RUNNING') {
       return;
     }
     this.diagnosticState = 'RUNNING';
@@ -304,8 +313,7 @@ struct Index {
   }
 
   private async requestProxyDiagnostics(): Promise<void> {
-    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || !this.whitelistContainsBridgeApp() ||
-      this.proxyDiagnosticState === 'RUNNING') {
+    if (this.vpnState !== 'ACTIVE' || !this.proxyEnabled || this.proxyDiagnosticState === 'RUNNING') {
       return;
     }
     this.proxyDiagnosticState = 'RUNNING';
@@ -409,7 +417,7 @@ struct Index {
   private vpnToggleDetail(): string {
     switch (this.vpnState) {
       case 'ACTIVE':
-        return `${this.trustedApplications.length} 个应用 · ${this.proxyEnabled ? '抓包模式' : '标准转发模式'}`;
+        return `${this.appRoutingScopeLabel()} · ${this.proxyEnabled ? '抓包模式' : '标准转发模式'}`;
       case 'STARTING':
       case 'AUTH_REQUIRED':
         return '正在建立安全连接';
@@ -420,89 +428,145 @@ struct Index {
       case 'FAILED':
         return '点击重试';
       default:
-        return this.trustedApplications.length > 0 ?
-          `${this.trustedApplications.length} 个应用 · 点击开启` : '请先配置应用白名单';
+        return canStartAppRouting(this.appRoutingMode, this.selectedApplications) ?
+          `${this.appRoutingScopeLabel()} · 点击开启` : 'APP 分流配置无效';
     }
   }
 
-  private async loadAppWhitelist(): Promise<void> {
-    this.whitelistError = '';
+  private async loadAppRouting(): Promise<void> {
+    this.appRoutingError = '';
     try {
-      this.trustedApplications = await loadTrustedApplications(this.uiAbilityContext());
-      this.whitelistDetail = this.trustedApplications.length > 0 ?
-        `已选择 ${this.trustedApplications.length} 个应用，仅这些应用会经过 VPN` :
-        '尚未添加应用；空白名单时 Tunnel 不会启动';
+      const routing: AppRoutingPreferences = await loadAppRoutingPreferences(this.uiAbilityContext());
+      this.appRoutingMode = routing.mode;
+      this.selectedApplications = routing.selectedApplications;
+      this.appRoutingDetail = this.appRoutingSelectionDetail();
     } catch (error) {
       const loadError: Error = error as Error;
-      this.whitelistError = `无法读取应用白名单：${loadError.message}`;
-      this.whitelistDetail = '请重新选择应用；Tunnel 会在白名单为空时拒绝启动';
+      this.appRoutingError = `无法读取 APP 分流设置：${loadError.message}`;
+      this.appRoutingDetail = '请重新配置；未成功读取设置前 Tunnel 不会启动';
     } finally {
-      this.whitelistLoaded = true;
+      this.appRoutingLoaded = true;
     }
   }
 
-  private whitelistEditable(): boolean {
-    return this.whitelistLoaded && !this.whitelistSaving && !this.vpnSwitchOn() && this.vpnState !== 'STOPPING';
+  private appRoutingEditable(): boolean {
+    return this.appRoutingLoaded && !this.appRoutingSaving && !this.vpnSwitchOn() && this.vpnState !== 'STOPPING';
   }
 
-  private whitelistContainsBridgeApp(): boolean {
-    return this.trustedApplications.indexOf(BUNDLE_NAME) >= 0;
-  }
-
-  private whitelistStatusLabel(): string {
-    if (!this.whitelistLoaded) {
+  private appRoutingStatusLabel(): string {
+    if (!this.appRoutingLoaded) {
       return '加载中';
     }
-    if (this.whitelistSaving) {
+    if (this.appRoutingSaving) {
       return '保存中';
     }
-    return this.trustedApplications.length === 0 ? '未配置' : `${this.trustedApplications.length} 个应用`;
+    return `${this.appRoutingModeLabel()} · ${this.selectedApplications.length} 个`;
   }
 
-  private whitelistStatusColor(): string {
-    if (!this.whitelistLoaded || this.whitelistSaving) {
+  private appRoutingStatusColor(): string {
+    if (!this.appRoutingLoaded || this.appRoutingSaving) {
       return '#38BDF8';
     }
-    return this.trustedApplications.length === 0 ? '#FBBF24' : '#22C55E';
+    return canStartAppRouting(this.appRoutingMode, this.selectedApplications) ? '#22C55E' : '#FBBF24';
   }
 
-  private async persistAppWhitelist(bundleNames: string[]): Promise<void> {
-    if (!this.whitelistEditable()) {
+  private appRoutingModeLabel(): string {
+    return this.appRoutingMode === AppRoutingMode.BLACKLIST ? '黑名单' : '白名单';
+  }
+
+  private appRoutingScopeLabel(): string {
+    if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+      return this.selectedApplications.length === 0 ? '所有应用' : `排除 ${this.selectedApplications.length} 个应用`;
+    }
+    return this.selectedApplications.length === 0 ? '仅本应用' :
+      `本应用 + ${this.selectedApplications.length} 个应用`;
+  }
+
+  private appRoutingSelectionDetail(): string {
+    if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+      return this.selectedApplications.length === 0 ?
+        '当前未排除应用；开启 Tunnel 后所有应用都会经过 VPN' :
+        `已选择 ${this.selectedApplications.length} 个应用；这些应用保持直连，本应用及其余应用经过 VPN`;
+    }
+    return this.selectedApplications.length > 0 ?
+      `已选择 ${this.selectedApplications.length} 个应用；本应用和这些应用会经过 VPN` :
+      '当前名单为空；仅本应用会经过 VPN';
+  }
+
+  private activeAppRoutingDetail(): string {
+    const connectionDetail: string = this.proxyEnabled ?
+      '正通过 USB 转发到 Mac，并启用 HTTP(S) 抓包' : '正使用 Mac 网络';
+    if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+      return this.selectedApplications.length === 0 ?
+        `所有应用${connectionDetail}` :
+        `除黑名单中的 ${this.selectedApplications.length} 个应用外，其余应用${connectionDetail}`;
+    }
+    return this.selectedApplications.length === 0 ?
+      `本应用${connectionDetail}，其余应用保持直连` :
+      `本应用及白名单中的 ${this.selectedApplications.length} 个应用${connectionDetail}，其余应用保持直连`;
+  }
+
+  private routingTechnicalScope(): string {
+    if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+      return this.selectedApplications.length === 0 ? '所有应用（黑名单为空）' :
+        `除 ${this.selectedApplications.length} 个黑名单应用外`;
+    }
+    return this.selectedApplications.length === 0 ? '仅本应用（白名单为空）' :
+      `本应用 + ${this.selectedApplications.length} 个白名单应用`;
+  }
+
+  private async requestSetAppRoutingMode(mode: AppRoutingMode): Promise<void> {
+    if (!this.appRoutingEditable() || mode === this.appRoutingMode) {
       return;
     }
-    this.whitelistSaving = true;
-    this.whitelistError = '';
+    this.appRoutingSaving = true;
+    this.appRoutingError = '';
     try {
-      this.trustedApplications = await saveTrustedApplications(this.uiAbilityContext(), bundleNames);
-      this.whitelistDetail = this.trustedApplications.length > 0 ?
-        `已选择 ${this.trustedApplications.length} 个应用，仅这些应用会经过 VPN` :
-        '尚未添加应用；空白名单时 Tunnel 不会启动';
+      this.appRoutingMode = await saveAppRoutingMode(this.uiAbilityContext(), mode);
+      this.appRoutingDetail = this.appRoutingSelectionDetail();
     } catch (error) {
       const saveError: Error = error as Error;
-      this.whitelistError = `应用白名单保存失败：${saveError.message}`;
+      this.appRoutingError = `分流模式保存失败：${saveError.message}`;
     } finally {
-      this.whitelistSaving = false;
+      this.appRoutingSaving = false;
     }
   }
 
-  private async requestSetWhitelistApp(bundleName: string, selected: boolean): Promise<void> {
-    if (!this.whitelistEditable()) {
+  private async persistSelectedApplications(bundleNames: string[]): Promise<void> {
+    if (!this.appRoutingEditable()) {
       return;
     }
-    const isSelected: boolean = this.trustedApplications.indexOf(bundleName) >= 0;
+    this.appRoutingSaving = true;
+    this.appRoutingError = '';
+    try {
+      this.selectedApplications = await saveSelectedApplications(this.uiAbilityContext(), bundleNames);
+      this.appRoutingDetail = this.appRoutingSelectionDetail();
+    } catch (error) {
+      const saveError: Error = error as Error;
+      this.appRoutingError = `APP 选择保存失败：${saveError.message}`;
+    } finally {
+      this.appRoutingSaving = false;
+    }
+  }
+
+  private async requestSetSelectedApp(bundleName: string, selected: boolean): Promise<void> {
+    if (!this.appRoutingEditable() || bundleName === BUNDLE_NAME) {
+      return;
+    }
+    const isSelected: boolean = this.selectedApplications.indexOf(bundleName) >= 0;
     if (selected === isSelected) {
       return;
     }
     const next: string[] = [];
-    for (let index: number = 0; index < this.trustedApplications.length; index++) {
-      if (this.trustedApplications[index] !== bundleName) {
-        next.push(this.trustedApplications[index]);
+    for (let index: number = 0; index < this.selectedApplications.length; index++) {
+      if (this.selectedApplications[index] !== bundleName) {
+        next.push(this.selectedApplications[index]);
       }
     }
     if (selected) {
       next.push(bundleName);
     }
-    await this.persistAppWhitelist(next);
+    await this.persistSelectedApplications(next);
   }
 
   private async loadInstalledApplicationList(): Promise<void> {
@@ -536,16 +600,34 @@ struct Index {
   }
 
   private visibleInstalledApplications(): InstalledApplication[] {
-    return filterInstalledApplications(this.installedApplications, this.applicationSearch);
+    const visible: InstalledApplication[] =
+      filterInstalledApplications(this.installedApplications, this.applicationSearch);
+    return prioritizeSelectedApplications(visible, this.selectedApplications);
   }
 
-  private unavailableTrustedApplications(): string[] {
+  private scrollAppPickerToTop(): void {
+    setTimeout(() => {
+      this.appPickerScroller.scrollEdge(Edge.Top);
+    }, 0);
+  }
+
+  private selectedApplicationDisplayName(bundleName: string): string {
+    for (let index: number = 0; index < this.installedApplications.length; index++) {
+      const application: InstalledApplication = this.installedApplications[index];
+      if (application.bundleName === bundleName) {
+        return applicationDisplayName(application);
+      }
+    }
+    return bundleName;
+  }
+
+  private unavailableSelectedApplications(): string[] {
     if (!this.applicationListLoaded) {
       return [];
     }
     const unavailable: string[] = [];
-    for (let trustedIndex: number = 0; trustedIndex < this.trustedApplications.length; trustedIndex++) {
-      const bundleName: string = this.trustedApplications[trustedIndex];
+    for (let selectedIndex: number = 0; selectedIndex < this.selectedApplications.length; selectedIndex++) {
+      const bundleName: string = this.selectedApplications[selectedIndex];
       let installed: boolean = false;
       for (let appIndex: number = 0; appIndex < this.installedApplications.length; appIndex++) {
         if (this.installedApplications[appIndex].bundleName === bundleName) {
@@ -690,11 +772,27 @@ struct Index {
     }
   }
 
+  private openAppPicker(): void {
+    if (!this.appRoutingEditable()) {
+      return;
+    }
+    this.applicationSearch = '';
+    this.showAppPicker = true;
+    if (!this.applicationListLoaded && !this.applicationListLoading) {
+      this.loadInstalledApplicationList();
+    }
+  }
+
   private closeSettings(): void {
+    this.showAppPicker = false;
     this.showSettings = false;
   }
 
   onBackPress(): boolean {
+    if (this.showAppPicker) {
+      this.showAppPicker = false;
+      return true;
+    }
     if (this.showSettings) {
       this.closeSettings();
       return true;
@@ -713,6 +811,14 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor('#09111F')
+    .bindSheet($$this.showAppPicker, this.AppPickerSheet(), {
+      height: SheetSize.LARGE,
+      preferType: SheetType.BOTTOM,
+      dragBar: true,
+      showClose: false,
+      backgroundColor: '#111C2E',
+      maskColor: '#99000000'
+    })
   }
 
   @Builder
@@ -961,91 +1067,92 @@ struct Index {
           .margin({ top: 6 })
 
         Column({ space: 12 }) {
-          this.CardHeader('APP 白名单', this.whitelistStatusLabel(), this.whitelistStatusColor())
-          Text('仅白名单中的应用流量经过 VPN，其余应用继续使用设备原网络。')
+          this.CardHeader('APP 分流', this.appRoutingStatusLabel(), this.appRoutingStatusColor())
+
+          Row({ space: 4 }) {
+            Button('白名单')
+              .enabled(this.appRoutingEditable())
+              .height(44)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.appRoutingMode === AppRoutingMode.WHITELIST ? '#FFFFFF' : '#94A3B8')
+              .backgroundColor(this.appRoutingMode === AppRoutingMode.WHITELIST ? '#2563EB' : '#00000000')
+              .borderRadius(10)
+              .layoutWeight(1)
+              .onClick(() => {
+                this.requestSetAppRoutingMode(AppRoutingMode.WHITELIST);
+              })
+            Button('黑名单')
+              .enabled(this.appRoutingEditable())
+              .height(44)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.appRoutingMode === AppRoutingMode.BLACKLIST ? '#FFFFFF' : '#94A3B8')
+              .backgroundColor(this.appRoutingMode === AppRoutingMode.BLACKLIST ? '#2563EB' : '#00000000')
+              .borderRadius(10)
+              .layoutWeight(1)
+              .onClick(() => {
+                this.requestSetAppRoutingMode(AppRoutingMode.BLACKLIST);
+              })
+          }
+          .width('100%')
+          .padding(4)
+          .backgroundColor('#172337')
+          .borderRadius(14)
+
+          Text(this.appRoutingDetail)
             .fontSize(14)
             .fontColor('#B8C6D9')
             .lineHeight(21)
             .width('100%')
 
           if (this.vpnSwitchOn() || this.vpnState === 'STOPPING') {
-            Text('请先关闭 Tunnel，再调整应用白名单。')
+            Text('请先关闭 Tunnel，再调整分流模式或应用列表。')
               .fontSize(13)
               .fontColor('#FBBF24')
               .lineHeight(19)
               .width('100%')
           }
 
-          if (this.whitelistLoaded && this.trustedApplications.length === 0) {
-            Text('当前没有应用会进入 VPN；为防止意外接管全部流量，Tunnel 将保持关闭。')
+          if (this.selectedApplications.length === 0) {
+            Text(this.appRoutingMode === AppRoutingMode.WHITELIST ?
+              '名单中尚未添加其他需要经过 Tunnel 的 APP' : '名单中尚未添加需要保持直连的 APP')
               .fontSize(13)
-              .fontColor('#FBBF24')
-              .lineHeight(19)
-              .width('100%')
-          }
-
-          Row({ space: 10 }) {
-            TextInput({ placeholder: '搜索 APP 名称或 Bundle 名称', text: this.applicationSearch })
-              .height(44)
-              .fontSize(13)
-              .fontColor('#F8FAFC')
-              .placeholderColor('#64748B')
-              .backgroundColor('#172337')
-              .layoutWeight(1)
-              .onChange((value: string) => {
-                this.applicationSearch = value;
-              })
-            Button(this.applicationListLoading ? '读取中' : '刷新')
-              .enabled(!this.applicationListLoading)
-              .height(44)
-              .fontSize(13)
-              .fontColor('#FFFFFF')
-              .backgroundColor('#2563EB')
-              .onClick(() => {
-                this.loadInstalledApplicationList();
-              })
-          }
-          .width('100%')
-
-          if (this.applicationListLoading && this.installedApplications.length === 0) {
-            Text('正在通过 USB 读取设备上的已安装 APP…')
-              .fontSize(13)
-              .fontColor('#7DD3FC')
-              .width('100%')
-          }
-
-          if (this.applicationListLoaded) {
-            Text(`${this.visibleInstalledApplications().length} / ${this.installedApplications.length} 个已安装 APP`)
-              .fontSize(12)
               .fontColor('#71839C')
               .width('100%')
+              .padding({ left: 14, right: 14, top: 16, bottom: 16 })
+              .backgroundColor('#172337')
+              .borderRadius(12)
           }
 
-          ForEach(this.visibleInstalledApplications(), (application: InstalledApplication) => {
+          ForEach(this.selectedApplications, (bundleName: string) => {
             Row({ space: 12 }) {
-              Checkbox({ name: application.bundleName, group: 'vpn_app_whitelist' })
-                .select(this.trustedApplications.indexOf(application.bundleName) >= 0)
-                .enabled(this.whitelistEditable())
-                .selectedColor('#2563EB')
+              Row() {
+                Text('✓')
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#7DD3FC')
+              }
                 .width(28)
                 .height(28)
-                .onChange((selected: boolean) => {
-                  this.requestSetWhitelistApp(application.bundleName, selected);
-                })
+                .justifyContent(FlexAlign.Center)
+                .backgroundColor('#163A57')
+                .borderRadius(14)
 
               Column({ space: 3 }) {
-                Text(applicationDisplayName(application))
+                Text(this.selectedApplicationDisplayName(bundleName))
                   .fontSize(14)
                   .fontWeight(FontWeight.Medium)
                   .fontColor('#E2E8F0')
                   .maxLines(1)
                   .width('100%')
-                Text(application.bundleName === BUNDLE_NAME ?
-                  `${application.bundleName} · 用于 Tunnel 网络检测` : application.bundleName)
-                  .fontSize(11)
-                  .fontColor('#71839C')
-                  .maxLines(2)
-                  .width('100%')
+                if (this.selectedApplicationDisplayName(bundleName) !== bundleName) {
+                  Text(bundleName)
+                    .fontSize(11)
+                    .fontColor('#71839C')
+                    .maxLines(2)
+                    .width('100%')
+                }
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
@@ -1054,68 +1161,28 @@ struct Index {
             .padding({ left: 12, right: 12, top: 10, bottom: 10 })
             .backgroundColor('#172337')
             .borderRadius(12)
-          }, (application: InstalledApplication) => application.bundleName)
-
-          if (this.applicationListLoaded && this.visibleInstalledApplications().length === 0) {
-            Text('没有匹配的 APP')
-              .fontSize(13)
-              .fontColor('#94A3B8')
-              .width('100%')
-              .padding({ top: 6, bottom: 6 })
-          }
-
-          ForEach(this.unavailableTrustedApplications(), (bundleName: string) => {
-            Row({ space: 12 }) {
-              Column({ space: 3 }) {
-                Text(bundleName)
-                  .fontSize(13)
-                  .fontColor('#CBD5E1')
-                  .maxLines(2)
-                  .width('100%')
-                Text('当前安装列表中已不可用')
-                  .fontSize(11)
-                  .fontColor('#FBBF24')
-                  .width('100%')
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              Button('移除')
-                .enabled(this.whitelistEditable())
-                .height(34)
-                .fontSize(12)
-                .fontColor('#FCA5A5')
-                .backgroundColor('#3A2028')
-                .onClick(() => {
-                  this.requestSetWhitelistApp(bundleName, false);
-                })
-            }
-            .width('100%')
-            .padding({ left: 12, right: 8, top: 9, bottom: 9 })
-            .backgroundColor('#172337')
-            .borderRadius(12)
           }, (bundleName: string) => bundleName)
 
-          Text(this.whitelistDetail)
-            .fontSize(12)
-            .fontColor('#71839C')
-            .lineHeight(18)
+          Button('名单管理')
+            .enabled(this.appRoutingEditable())
+            .height(46)
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#2563EB')
             .width('100%')
+            .onClick(() => {
+              this.openAppPicker();
+            })
 
-          if (this.whitelistError.length > 0) {
-            Text(this.whitelistError)
+          if (this.appRoutingError.length > 0) {
+            Text(this.appRoutingError)
               .fontSize(13)
               .fontColor('#FCA5A5')
               .lineHeight(19)
               .width('100%')
           }
 
-          if (this.applicationListError.length > 0) {
-            Text(this.applicationListError)
-              .fontSize(13)
-              .fontColor('#FCA5A5')
-              .lineHeight(19)
-              .width('100%')
-          }
         }
         .width('100%')
         .padding(18)
@@ -1171,16 +1238,14 @@ struct Index {
             this.diagnosticStateLabel(this.proxyDiagnosticState) : '未启用',
             this.proxyEnabled ? this.diagnosticStateColor(this.proxyDiagnosticState) : '#94A3B8')
           Text(this.proxyEnabled ?
-            (this.whitelistContainsBridgeApp() ? this.proxyDiagnosticDetail :
-              `将 ${BUNDLE_NAME} 加入白名单后，才可从本应用检测抓包链路。`) :
+            this.proxyDiagnosticDetail :
             'Mac 当前为标准转发模式。运行 harmony-netbridge proxy 后重新开启 Tunnel，即可使用抓包功能。')
             .fontSize(14)
             .fontColor('#B8C6D9')
             .lineHeight(21)
             .width('100%')
           Button('检测 HTTP 抓包')
-            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.whitelistContainsBridgeApp() &&
-              this.proxyDiagnosticState !== 'RUNNING')
+            .enabled(this.vpnState === 'ACTIVE' && this.proxyEnabled && this.proxyDiagnosticState !== 'RUNNING')
             .backgroundColor('#B45309')
             .fontColor('#FFFFFF')
             .width('100%')
@@ -1196,15 +1261,13 @@ struct Index {
         Column({ space: 12 }) {
           this.CardHeader('网络连接检测', this.diagnosticStateLabel(this.diagnosticState),
             this.diagnosticStateColor(this.diagnosticState))
-          Text(this.whitelistContainsBridgeApp() ? this.diagnosticDetail :
-            `将 ${BUNDLE_NAME} 加入白名单后，才可从本应用检测 Tunnel 网络。`)
+          Text(this.diagnosticDetail)
             .fontSize(14)
             .fontColor('#B8C6D9')
             .lineHeight(21)
             .width('100%')
           Button('运行网络检测')
-            .enabled(this.vpnState === 'ACTIVE' && this.whitelistContainsBridgeApp() &&
-              this.diagnosticState !== 'RUNNING')
+            .enabled(this.vpnState === 'ACTIVE' && this.diagnosticState !== 'RUNNING')
             .backgroundColor('#0F766E')
             .fontColor('#FFFFFF')
             .width('100%')
@@ -1287,7 +1350,7 @@ struct Index {
             .width('100%')
           this.InfoRow('USB 通道', 'hdc rport + 本机回环连接')
           this.InfoRow('网络协议', 'IPv4 TCP / UDP / DNS')
-          this.InfoRow('流量范围', `${this.trustedApplications.length} 个白名单应用`)
+          this.InfoRow('流量范围', this.routingTechnicalScope())
           this.InfoRow('VPN 状态', this.vpnStateLabel())
           this.InfoRow('流量转发', 'gVisor 用户态网络栈')
           this.InfoRow('抓包模式', this.proxyEnabled ? 'mitmweb 已启用' : '未启用')
@@ -1311,6 +1374,187 @@ struct Index {
     .height('100%')
     .backgroundColor('#09111F')
     .scrollBar(BarState.Off)
+  }
+
+  @Builder
+  AppPickerSheet() {
+    Column({ space: 14 }) {
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('选择 APP')
+            .fontSize(21)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#F8FAFC')
+            .width('100%')
+          Text(`${this.appRoutingModeLabel()} · 已选 ${this.selectedApplications.length} 个`)
+            .fontSize(12)
+            .fontColor('#71839C')
+            .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        Button('完成')
+          .enabled(!this.appRoutingSaving)
+          .height(38)
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#2563EB')
+          .onClick(() => {
+            this.showAppPicker = false;
+          })
+      }
+      .width('100%')
+
+      Text(this.appRoutingMode === AppRoutingMode.WHITELIST ?
+        '勾选其他需要经过 Tunnel 的 APP；本应用已自动包含。' :
+        '勾选需要保持设备直连的 APP；本应用不会加入黑名单。')
+        .fontSize(13)
+        .fontColor('#B8C6D9')
+        .width('100%')
+
+      Row({ space: 10 }) {
+        TextInput({ placeholder: '搜索 APP 名称或 Bundle 名称', text: this.applicationSearch })
+          .height(44)
+          .fontSize(13)
+          .fontColor('#F8FAFC')
+          .placeholderColor('#64748B')
+          .backgroundColor('#172337')
+          .layoutWeight(1)
+          .onChange((value: string) => {
+            this.applicationSearch = value;
+            this.scrollAppPickerToTop();
+          })
+        Button(this.applicationListLoading ? '读取中' : '刷新')
+          .enabled(!this.applicationListLoading)
+          .height(44)
+          .fontSize(13)
+          .fontColor('#FFFFFF')
+          .backgroundColor('#26364D')
+          .onClick(() => {
+            this.loadInstalledApplicationList();
+          })
+      }
+      .width('100%')
+
+      if (this.applicationListLoading && this.installedApplications.length === 0) {
+        Text('正在通过 USB 读取设备上的已安装 APP…')
+          .fontSize(13)
+          .fontColor('#7DD3FC')
+          .width('100%')
+      }
+
+      if (this.applicationListLoaded) {
+        Text(`${this.visibleInstalledApplications().length} / ${this.installedApplications.length} 个已安装 APP`)
+          .fontSize(12)
+          .fontColor('#71839C')
+          .width('100%')
+      }
+
+      if (this.applicationListError.length > 0) {
+        Text(this.applicationListError)
+          .fontSize(13)
+          .fontColor('#FCA5A5')
+          .lineHeight(19)
+          .width('100%')
+      }
+
+      Scroll(this.appPickerScroller) {
+        Column({ space: 8 }) {
+          ForEach(this.visibleInstalledApplications(), (application: InstalledApplication) => {
+            Row({ space: 12 }) {
+              Checkbox({ name: application.bundleName, group: 'vpn_app_routing_selection' })
+                .select(this.selectedApplications.indexOf(application.bundleName) >= 0)
+                .enabled(this.appRoutingEditable())
+                .selectedColor('#2563EB')
+                .width(28)
+                .height(28)
+                .onChange((selected: boolean) => {
+                  this.requestSetSelectedApp(application.bundleName, selected);
+                })
+
+              Column({ space: 3 }) {
+                Text(applicationDisplayName(application))
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#E2E8F0')
+                  .maxLines(1)
+                  .width('100%')
+                Text(application.bundleName)
+                  .fontSize(11)
+                  .fontColor('#71839C')
+                  .maxLines(2)
+                  .width('100%')
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .backgroundColor('#172337')
+            .borderRadius(12)
+          }, (application: InstalledApplication) => application.bundleName)
+
+          if (this.applicationListLoaded && this.visibleInstalledApplications().length === 0) {
+            Text('没有匹配的 APP')
+              .fontSize(13)
+              .fontColor('#94A3B8')
+              .width('100%')
+              .padding({ top: 20, bottom: 20 })
+              .textAlign(TextAlign.Center)
+          }
+
+          if (this.unavailableSelectedApplications().length > 0) {
+            Text('已选但当前不可用')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor('#FBBF24')
+              .width('100%')
+              .margin({ top: 6 })
+          }
+
+          ForEach(this.unavailableSelectedApplications(), (bundleName: string) => {
+            Row({ space: 12 }) {
+              Column({ space: 3 }) {
+                Text(bundleName)
+                  .fontSize(13)
+                  .fontColor('#CBD5E1')
+                  .maxLines(2)
+                  .width('100%')
+                Text('当前安装列表中已不可用')
+                  .fontSize(11)
+                  .fontColor('#FBBF24')
+                  .width('100%')
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+              Button('移除')
+                .enabled(this.appRoutingEditable())
+                .height(34)
+                .fontSize(12)
+                .fontColor('#FCA5A5')
+                .backgroundColor('#3A2028')
+                .onClick(() => {
+                  this.requestSetSelectedApp(bundleName, false);
+                })
+            }
+            .width('100%')
+            .padding({ left: 12, right: 8, top: 9, bottom: 9 })
+            .backgroundColor('#172337')
+            .borderRadius(12)
+          }, (bundleName: string) => bundleName)
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20, top: 12, bottom: 24 })
+    .backgroundColor('#111C2E')
   }
 
   @Builder

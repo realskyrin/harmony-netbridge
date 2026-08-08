@@ -8,7 +8,15 @@ import hnbNative, {
   PacketPumpStatus
 } from 'libhnb.so';
 import { encodeUtf8 } from '../bridge/HnbProtocol';
-import { decodeTrustedApplications } from '../vpn/AppWhitelist';
+import {
+  ALWAYS_TUNNELED_BUNDLE_NAME,
+  AppRoutingMode,
+  buildVpnApplicationRouting,
+  canStartAppRouting,
+  decodeAppRoutingMode,
+  decodeSelectedApplications,
+  VpnApplicationRouting
+} from '../vpn/AppWhitelist';
 import { GateTunnel } from '../vpn/GateTunnel';
 import { reconnectDelay } from '../vpn/ReconnectPolicy';
 import { VpnControlHandshake, VpnControlSession } from '../vpn/VpnControlSession';
@@ -17,7 +25,7 @@ import { VPN_STOP_EVENT, VpnRuntimeState } from '../vpn/VpnRuntimeState';
 const DOMAIN: number = 0x484E;
 const TAG: string = 'HNBVpn';
 const GATE_TAG: string = 'HNBGateV';
-const BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
+const BUNDLE_NAME: string = ALWAYS_TUNNELED_BUNDLE_NAME;
 const EXTENSION_NAME: string = 'HarmonyNetBridgeVpnExtensionAbility';
 const BRIDGE_ADDRESS: string = '127.0.0.1';
 const BRIDGE_PORT: number = 27183;
@@ -39,7 +47,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
 
   private controlSession: VpnControlSession | undefined = undefined;
   private proxyEnabled: boolean = false;
-  private trustedApplications: string[] = [];
+  private appRoutingMode: AppRoutingMode = AppRoutingMode.WHITELIST;
+  private selectedApplications: string[] = [];
   private pumpStarted: boolean = false;
   private destroyRequested: boolean = false;
   private cleanupPromise: Promise<void> | undefined = undefined;
@@ -56,13 +65,16 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       this.runGateV();
       return;
     }
-    const encodedWhitelist: string = want.parameters === undefined ||
-      want.parameters['trustedApplications'] === undefined ? '' :
-      want.parameters['trustedApplications'] as string;
-    this.trustedApplications = decodeTrustedApplications(encodedWhitelist);
-    if (this.trustedApplications.length === 0) {
-      VpnRuntimeState.publish('FAILED', '应用白名单为空，已拒绝创建 VPN', false);
-      hilog.warn(DOMAIN, TAG, 'VPN_START_REJECTED empty_app_whitelist');
+    const encodedRoutingMode: string = want.parameters === undefined ||
+      want.parameters['routingMode'] === undefined ? '' : want.parameters['routingMode'] as string;
+    const encodedApplications: string = want.parameters === undefined ||
+      want.parameters['selectedApplications'] === undefined ? '' :
+      want.parameters['selectedApplications'] as string;
+    this.appRoutingMode = decodeAppRoutingMode(encodedRoutingMode);
+    this.selectedApplications = decodeSelectedApplications(encodedApplications);
+    if (!canStartAppRouting(this.appRoutingMode, this.selectedApplications)) {
+      VpnRuntimeState.publish('FAILED', 'APP 分流配置无效，已拒绝创建 VPN', false);
+      hilog.warn(DOMAIN, TAG, 'VPN_START_REJECTED invalid_app_routing');
       this.stopOwnExtension();
       return;
     }
@@ -182,6 +194,10 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     }
     hilog.info(DOMAIN, TAG, 'PHASE3_PROTECT_OK');
 
+    const appRouting: VpnApplicationRouting = buildVpnApplicationRouting(
+      this.appRoutingMode,
+      this.selectedApplications
+    );
     const config: vpnExtension.VpnConfig = {
       addresses: [
         {
@@ -206,8 +222,8 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       isIPv4Accepted: true,
       isIPv6Accepted: false,
       isBlocking: false,
-      trustedApplications: this.trustedApplications.slice(),
-      blockedApplications: []
+      trustedApplications: appRouting.trustedApplications,
+      blockedApplications: appRouting.blockedApplications
     };
     let tunFd: number;
     try {
@@ -217,17 +233,15 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       throw new Error(`VPN create failed: ${createError.code}`);
     }
     this.vpnCreated = true;
-    hilog.info(DOMAIN, TAG, 'PHASE3_VPN_CREATE_OK mtu=%{public}d trusted_apps=%{public}d',
-      handshake.mtu, this.trustedApplications.length);
+    hilog.info(DOMAIN, TAG, 'PHASE3_VPN_CREATE_OK mtu=%{public}d routing_mode=%{public}s selected_apps=%{public}d',
+      handshake.mtu, this.appRoutingMode, this.selectedApplications.length);
 
     const startResult: number = hnbNative.startPacketPump(tunFd);
     if (startResult !== 0) {
       throw new Error(`Native packet pump failed to start: ${startResult}`);
     }
     this.pumpStarted = true;
-    const activeDetail: string = handshake.proxyEnabled ?
-      `${this.trustedApplications.length} 个白名单应用已接入 Mac 抓包代理 · MTU ${handshake.mtu}` :
-      `${this.trustedApplications.length} 个白名单应用已通过 USB 转发到 Mac · MTU ${handshake.mtu}`;
+    const activeDetail: string = this.activeRoutingDetail(handshake.proxyEnabled, handshake.mtu);
     VpnRuntimeState.publish('ACTIVE', activeDetail, handshake.proxyEnabled);
     await controlSession.reportStatus('ACTIVE', 'packet_pump_started');
     hilog.info(DOMAIN, TAG, 'PHASE3_ACTIVE');
@@ -240,6 +254,18 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       this.waitForPumpStop(),
       this.waitForUIStop()
     ]);
+  }
+
+  private activeRoutingDetail(proxyEnabled: boolean, mtu: number): string {
+    const connectionDetail: string = proxyEnabled ? '已接入 Mac 抓包代理' : '已通过 USB 转发到 Mac';
+    if (this.appRoutingMode === AppRoutingMode.BLACKLIST) {
+      return this.selectedApplications.length === 0 ?
+        `所有应用${connectionDetail} · MTU ${mtu}` :
+        `除 ${this.selectedApplications.length} 个黑名单应用外，其余应用${connectionDetail} · MTU ${mtu}`;
+    }
+    return this.selectedApplications.length === 0 ?
+      `本应用${connectionDetail} · MTU ${mtu}` :
+      `本应用及 ${this.selectedApplications.length} 个白名单应用${connectionDetail} · MTU ${mtu}`;
   }
 
   private waitForPumpStop(): Promise<string> {
