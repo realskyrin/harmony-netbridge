@@ -140,7 +140,7 @@ HarmonyOS App：
    ./bin/harmony-netbridge stop
    ```
 
-   daemon 会先向 App 发送 `STOP_REQUEST`；设备停止 PacketPump、销毁 VPN 后，Mac 只删除本实例创建的精确 hdc 映射。
+   daemon 会先向 App 发送 `STOP_REQUEST`；设备停止 PacketPump、销毁 VPN 后，Mac 只删除本实例创建的精确 hdc 映射。App 内关闭 Tunnel 时，各项系统清理与终态通知均有截止时间；若系统 Promise 未返回，会继续执行幂等清理，并由 UI watchdog 请求系统强制停止，避免永久停在“正在关闭 Tunnel”。
 
 ### APP 白名单与黑名单分流
 

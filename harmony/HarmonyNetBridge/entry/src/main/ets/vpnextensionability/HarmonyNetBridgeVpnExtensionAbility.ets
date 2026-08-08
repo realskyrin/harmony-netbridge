@@ -22,6 +22,12 @@ import { GateTunnel } from '../vpn/GateTunnel';
 import { reconnectDelay } from '../vpn/ReconnectPolicy';
 import { VpnControlHandshake, VpnControlSession } from '../vpn/VpnControlSession';
 import { VPN_STOP_EVENT, VpnRuntimeState } from '../vpn/VpnRuntimeState';
+import {
+  completeWithin,
+  VPN_CONTROL_STEP_TIMEOUT_MS,
+  VPN_DESTROY_TIMEOUT_MS,
+  VPN_STATUS_PUBLISH_TIMEOUT_MS
+} from '../vpn/VpnStopTimeout';
 
 const DOMAIN: number = 0x484E;
 const TAG: string = 'HNBVpn';
@@ -157,7 +163,16 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       await this.cleanupPhase3(reportStopped);
       this.unsubscribeFromUIStop();
       if (reportStopped) {
-        VpnRuntimeState.publish('STOPPED', 'VPN 已安全销毁', this.proxyEnabled);
+        try {
+          await completeWithin(
+            VpnRuntimeState.publishAndWait('STOPPED', 'VPN 已安全销毁', this.proxyEnabled),
+            VPN_STATUS_PUBLISH_TIMEOUT_MS,
+            'publish stopped status'
+          );
+        } catch (error) {
+          const publishError: Error = error as Error;
+          hilog.warn(DOMAIN, TAG, 'PHASE3_STOPPED_PUBLISH_INCOMPLETE message=%{public}s', publishError.message);
+        }
       }
       await this.stopOwnExtension();
     }
@@ -356,29 +371,40 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
   private async performPhase3Cleanup(reportStopped: boolean): Promise<void> {
     hnbNative.stopPacketPump();
     this.pumpStarted = false;
-    if (this.vpnCreated && this.vpnConnection !== undefined) {
-      try {
-        await this.vpnConnection.destroy();
-        hilog.info(DOMAIN, TAG, 'PHASE3_VPN_DESTROY_OK');
-      } catch (error) {
-        const destroyError: BusinessError = error as BusinessError;
-        hilog.warn(DOMAIN, TAG, 'PHASE3_VPN_DESTROY_FAIL code=%{public}d', destroyError.code);
-      }
-      this.vpnCreated = false;
-    }
+    const vpnConnection: vpnExtension.VpnConnection | undefined = this.vpnConnection;
+    const shouldDestroyVpn: boolean = this.vpnCreated && vpnConnection !== undefined;
+    this.vpnCreated = false;
+    this.vpnConnection = undefined;
     const controlSession: VpnControlSession | undefined = this.controlSession;
     this.controlSession = undefined;
+    if (shouldDestroyVpn && vpnConnection !== undefined) {
+      try {
+        await completeWithin(vpnConnection.destroy(), VPN_DESTROY_TIMEOUT_MS, 'destroy VPN connection');
+        hilog.info(DOMAIN, TAG, 'PHASE3_VPN_DESTROY_OK');
+      } catch (error) {
+        const destroyError: Error = error as Error;
+        hilog.warn(DOMAIN, TAG, 'PHASE3_VPN_DESTROY_INCOMPLETE message=%{public}s', destroyError.message);
+      }
+    }
     if (controlSession !== undefined) {
       if (reportStopped) {
         try {
-          await controlSession.reportStatus('STOPPED', 'vpn_destroyed');
+          await completeWithin(
+            controlSession.reportStatus('STOPPED', 'vpn_destroyed'),
+            VPN_CONTROL_STEP_TIMEOUT_MS,
+            'report stopped status'
+          );
         } catch (error) {
           // The Mac may already have closed its control socket.
         }
       }
-      await controlSession.close();
+      try {
+        await completeWithin(controlSession.close(), VPN_CONTROL_STEP_TIMEOUT_MS, 'close control session');
+      } catch (error) {
+        const closeError: Error = error as Error;
+        hilog.warn(DOMAIN, TAG, 'PHASE3_CONTROL_CLOSE_INCOMPLETE message=%{public}s', closeError.message);
+      }
     }
-    this.vpnConnection = undefined;
   }
 
   // Gate V deliberately installs only one /32 route and immediately destroys

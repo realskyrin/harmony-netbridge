@@ -144,6 +144,8 @@ App 返回空 payload 的 `STOP_ACK`。VpnExtensionAbility 的清理顺序为：
 4. 关闭 Control socket；
 5. 结束 Extension。
 
+设备端的 VPN `destroy()`、终态上报、Control close 与 `STOPPED` 事件发布都使用分步截止时间；单个 HarmonyOS Promise 未返回时，后续幂等清理仍会继续。App 停止按钮另有 6 秒 watchdog：若仍未收到终态，会调用系统 `stopVpnExtensionAbility()` 收束 Extension，并退出瞬时 `STOPPING` 状态。
+
 daemon 发送 `STOP_REQUEST` 后会在有界时间内等待 `STOP_ACK`，再关闭 Control/Data 连接。这样正常停止不会与 socket close 竞态并被设备误判为 transport failure；超时后仍会强制清理本实例资源。
 
 Control 连接或 Data 连接意外断开时，设备必须先停止 PacketPump 并销毁 VPN，避免保留一个无法转发的默认路由；随后按 1、2、4、8、10 秒上限退避，创建全新的 Control token、Data socket 与 VPN。`STOP_REQUEST`、App 停止按钮和系统销毁属于终止事件，不进入重连。

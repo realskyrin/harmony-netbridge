@@ -35,14 +35,26 @@ export class VpnRuntimeState {
 
   static publish(state: string, detail: string,
     proxyEnabled: boolean = VpnRuntimeState.current.proxyEnabled): void {
-    VpnRuntimeState.current = new VpnRuntimeSnapshot(state, detail, proxyEnabled);
-    const payload: VpnRuntimeEventPayload = { state: state, detail: detail, proxyEnabled: proxyEnabled };
+    const payload: VpnRuntimeEventPayload = VpnRuntimeState.updateSnapshot(state, detail, proxyEnabled);
     commonEventManager.publish(VPN_STATUS_EVENT, {
       bundleName: BUNDLE_NAME,
       data: JSON.stringify(payload)
     }, () => {
       // Status delivery is best effort; the Mac control channel remains the
       // source of truth if the foreground Ability is not running.
+    });
+  }
+
+  static publishAndWait(state: string, detail: string,
+    proxyEnabled: boolean = VpnRuntimeState.current.proxyEnabled): Promise<void> {
+    const payload: VpnRuntimeEventPayload = VpnRuntimeState.updateSnapshot(state, detail, proxyEnabled);
+    return new Promise<void>((resolve: () => void) => {
+      commonEventManager.publish(VPN_STATUS_EVENT, {
+        bundleName: BUNDLE_NAME,
+        data: JSON.stringify(payload)
+      }, () => {
+        resolve();
+      });
     });
   }
 
@@ -70,5 +82,11 @@ export class VpnRuntimeState {
     }, () => {
       // The Extension reports the terminal state through VPN_STATUS_EVENT.
     });
+  }
+
+  private static updateSnapshot(state: string, detail: string,
+    proxyEnabled: boolean): VpnRuntimeEventPayload {
+    VpnRuntimeState.current = new VpnRuntimeSnapshot(state, detail, proxyEnabled);
+    return { state: state, detail: detail, proxyEnabled: proxyEnabled };
   }
 }

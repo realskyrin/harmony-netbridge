@@ -26,6 +26,11 @@ import { VpnDiagnosticResult, VpnNetworkDiagnostics } from '../vpn/VpnNetworkDia
 import { ProxyCertificate } from '../vpn/ProxyCertificate';
 import { ProxyDiagnostics } from '../vpn/ProxyDiagnostics';
 import { VPN_STATUS_EVENT, VpnRuntimeSnapshot, VpnRuntimeState } from '../vpn/VpnRuntimeState';
+import {
+  completeWithin,
+  VPN_FORCE_STOP_TIMEOUT_MS,
+  VPN_STOP_WATCHDOG_TIMEOUT_MS
+} from '../vpn/VpnStopTimeout';
 
 const BUNDLE_NAME: string = ALWAYS_TUNNELED_BUNDLE_NAME;
 const EXTENSION_NAME: string = 'HarmonyNetBridgeVpnExtensionAbility';
@@ -69,6 +74,7 @@ struct Index {
   private installedApplicationSource: InstalledApplicationSource = new InstalledApplicationSource();
   private appPickerScroller: Scroller = new Scroller();
   private vpnStatusTimer: number = -1;
+  private vpnStopWatchdogTimer: number = -1;
   private vpnStatusSubscriber: commonEventManager.CommonEventSubscriber | undefined = undefined;
 
   aboutToAppear(): void {
@@ -105,6 +111,7 @@ struct Index {
       clearInterval(this.vpnStatusTimer);
       this.vpnStatusTimer = -1;
     }
+    this.clearVpnStopWatchdog();
     const subscriber: commonEventManager.CommonEventSubscriber | undefined = this.vpnStatusSubscriber;
     this.vpnStatusSubscriber = undefined;
     if (subscriber !== undefined) {
@@ -261,6 +268,38 @@ struct Index {
     VpnRuntimeState.publish('STOPPING', '正在安全关闭 VPN Tunnel');
     this.refreshVpnStatus();
     VpnRuntimeState.requestStop();
+    this.clearVpnStopWatchdog();
+    this.vpnStopWatchdogTimer = setTimeout(() => {
+      this.forceStopVpnAfterTimeout();
+    }, VPN_STOP_WATCHDOG_TIMEOUT_MS);
+  }
+
+  private async forceStopVpnAfterTimeout(): Promise<void> {
+    this.vpnStopWatchdogTimer = -1;
+    if (this.vpnState !== 'STOPPING') {
+      return;
+    }
+    try {
+      await completeWithin(vpnExtension.stopVpnExtensionAbility({
+        bundleName: BUNDLE_NAME,
+        abilityName: EXTENSION_NAME
+      }), VPN_FORCE_STOP_TIMEOUT_MS, 'force stop VPN extension');
+    } catch (error) {
+      // A completed graceful stop can make the fallback report that the
+      // Extension no longer exists. Either way, do not strand the UI in the
+      // transient STOPPING state after the system stop request was issued.
+    }
+    if (this.vpnState === 'STOPPING') {
+      VpnRuntimeState.publish('STOPPED', 'VPN 已关闭；系统已完成超时收束', false);
+      this.refreshVpnStatus();
+    }
+  }
+
+  private clearVpnStopWatchdog(): void {
+    if (this.vpnStopWatchdogTimer >= 0) {
+      clearTimeout(this.vpnStopWatchdogTimer);
+      this.vpnStopWatchdogTimer = -1;
+    }
   }
 
   private refreshVpnStatus(): void {
@@ -268,6 +307,9 @@ struct Index {
     const snapshot: VpnRuntimeSnapshot = VpnRuntimeState.snapshot;
     this.vpnState = snapshot.state;
     this.vpnDetail = snapshot.detail;
+    if (this.vpnState !== 'STOPPING') {
+      this.clearVpnStopWatchdog();
+    }
     this.proxyEnabled = this.vpnOwnsUsbBridge() ? snapshot.proxyEnabled : this.macProxyEnabled;
     if (this.proxyDiagnosticState === 'NOT_RUN') {
       this.proxyDiagnosticDetail = this.proxyEnabled ?
