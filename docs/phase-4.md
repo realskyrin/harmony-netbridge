@@ -4,7 +4,7 @@
 
 Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修改手机全局代理，也不改变 HNB/1 帧格式。
 
-当前 App 在这一数据面前增加了按 App 白名单/黑名单分流：设置页主卡片只展示已选 APP，点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表，已选 APP 会自动排在未选 APP 前面，两种模式共用同一份选中结果。HarmonyNetBridge 自身从名单中隐藏并始终进入 TUN：白名单只下发包含本应用和选中 Bundle 的 `VpnConfig.trustedApplications`；黑名单只下发包含选中 Bundle 的 `blockedApplications`，并强制从中排除本应用。未使用的可选名单字段不会以空数组下发，避免设备错误选择名单策略。空白名单只接管本应用，空黑名单省略两个名单字段并接管全部 App。
+当前 App 在这一数据面前增加了按 App 白名单/黑名单分流：设置页主卡片只展示已选 APP，点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表，已选 APP 会自动排在未选 APP 前面，两种模式共用同一份选中结果。HarmonyNetBridge 自身从名单中隐藏并始终进入 TUN：白名单只下发包含本应用和选中 Bundle 的 `VpnConfig.trustedApplications`；黑名单只下发包含选中 Bundle 的 `blockedApplications`，并强制从中排除本应用。未使用的可选名单字段不会以空数组下发，避免设备错误选择名单策略。空白名单只接管本应用，空黑名单省略两个名单字段并接管全部 App。白名单会生成独立 `vpnId` 并由系统把空接口名绑定到 `multitun-vpnN`，只接管允许的 App UID；黑名单则使用 `vpn-tun`，让 Android 兼容容器等系统转发流量也进入 Tunnel，再排除被选中的鸿蒙 Bundle。API 20 要求仅适用于白名单隔离，旧系统仍可使用黑名单模式。
 
 已实现：
 
@@ -15,6 +15,7 @@ Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修�
 - HNB/1 `HELLO_ACK.capabilities` 增加可选 `proxy`；Harmony App 据此展示模式，并在 Google 与百度之间随机选择纯 HTTP 目标执行链路自检。
 - daemon 在同一 hdc loopback 端口提供唯一只读路径 `/mitmproxy-ca-cert.cer`；仅代理模式可用，并在发送前验证文件是有界的 X.509 CA。其他 proxy 文件、私钥、capture 与 Web UI 信息均不可寻址。
 - daemon 在同一端口提供 `/installed-apps.json`：优先以 `bm dump -a -l` 返回本地化 APP 名称与 Bundle 名称，不支持时回退 `bm dump -a`；接口只接受当前 HNB 控制会话的随机 Bearer token，不申请手机端系统级包管理权限。
+- 白名单 VPN 会话使用 API 20 的独立 `vpnId`，精确销毁对应多 VPN 实例；默认路由由系统解析为本次 `multitun-vpnN`。黑名单会话不设置 `vpnId`，使用 `vpn-tun` 处理全部未被 Bundle 黑名单排除的流量，包括 Android 兼容容器。白名单真机回归中，Android Chrome 产生的 `ancowlan0` 包不增加 TUN 或 Mac relay 计数，而隐式白名单成员的 TCP、UDP 和 DNS 自检仍通过；黑名单需要反向验证同一 Chrome 流量会增加 `vpn-tun` 与 Mac relay 计数。
 - App 可将该公共 CA 直接保存到手机应用目录，再以 `general.cer-certificate` 文件类型和只读 URI 授权交给系统证书管理器；不请求 `MANAGE_VPN`，不静默安装证书，也不修改系统信任策略。
 - daemon 正常停止会先停止手机 VPN，再终止本次启动的 mitmweb；异常退出后的下一次启动只在 PID 与完整受管参数均匹配时回收 orphan。
 
@@ -129,7 +130,7 @@ Mac 到企业 upstream 是另一条独立的 TLS 信任链。若 mitmweb 的 Pyt
 ## 真机验收步骤
 
 1. 安装 0.4.0 签名 HAP，运行 `./bin/harmony-netbridge proxy --no-open-browser --mtu 1280`。
-2. 在 App 设置中选择分流模式，点击“名单管理”打开 APP 选择 Bottom Sheet 配置目标 App：白名单模式选中需要分流的其他 App，黑名单模式选中需要保持直连的 App。确认 HarmonyNetBridge 自身不出现在名单中；它会始终进入 Tunnel。关闭 Sheet 后主卡片应只显示已选 APP。开启 Tunnel，确认 UI 识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。另用一个不经过 VPN 的 App 验证其仍可通过设备原网络访问：白名单模式选择未勾选 App，黑名单模式选择已勾选 App；该 App 的请求不得出现在 mitmweb 中。
+2. 在 App 设置中选择分流模式，点击“名单管理”打开 APP 选择 Bottom Sheet 配置目标 App：白名单模式选中需要分流的其他 App，黑名单模式选中需要保持直连的 App。确认 HarmonyNetBridge 自身不出现在名单中；它会始终进入 Tunnel。关闭 Sheet 后主卡片应只显示已选 APP。开启 Tunnel：白名单应创建 `multitun-vpnN`，未勾选的 Android Chrome 流量不得增加 TUN、Mac relay 或 mitmweb flow 计数；黑名单应创建 `vpn-tun`，Android Chrome 等未被排除的容器流量必须增加 TUN 与 Mac relay 计数。两种模式下 UI 都应识别抓包模式，CLI 为 `DATA_CONNECTED / ACTIVE / Proxy ACTIVE`。
 3. App 点击“验证 HTTP 抓包链路”；确认 `PASS`、CLI `proxied TCP` 增长且 capture 大小增加。
 4. 在 mitmweb 中确认本次随机选中的 Google 或百度 HTTP flow。不要把请求头或认证数据复制到验收日志。
 5. 如需 HTTPS，在 App 点击“下载 Mac CA 证书”，成功后点击“用证书管理器打开”，在系统界面自行确认安装；未安装前的 TLS 信任失败属于预期边界。

@@ -1,5 +1,5 @@
 import { Want } from '@kit.AbilityKit';
-import { BusinessError, commonEventManager } from '@kit.BasicServicesKit';
+import { BusinessError, commonEventManager, deviceInfo } from '@kit.BasicServicesKit';
 import { socket, vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import hnbNative, {
@@ -10,12 +10,17 @@ import hnbNative, {
 import { encodeUtf8 } from '../bridge/HnbProtocol';
 import {
   ALWAYS_TUNNELED_BUNDLE_NAME,
+  applyVpnApplicationIsolation,
   applyVpnApplicationRouting,
   AppRoutingMode,
   buildVpnApplicationRouting,
   canStartAppRouting,
   decodeAppRoutingMode,
   decodeSelectedApplications,
+  supportsVpnApplicationRouting,
+  usesIsolatedVpnApplicationRouting,
+  vpnApplicationRouteInterface,
+  VPN_APPLICATION_ISOLATION_MIN_API_VERSION,
   VpnApplicationRouting
 } from '../vpn/AppWhitelist';
 import { GateTunnel } from '../vpn/GateTunnel';
@@ -47,6 +52,7 @@ type UIStopResolve = (reason: string) => void;
 export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbility {
   private mode: string = 'vpn';
   private vpnConnection: vpnExtension.VpnConnection | undefined = undefined;
+  private vpnId: string | undefined = undefined;
   private vpnCreated: boolean = false;
 
   private gateTunnel: GateTunnel | undefined = undefined;
@@ -82,6 +88,14 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     if (!canStartAppRouting(this.appRoutingMode, this.selectedApplications)) {
       VpnRuntimeState.publish('FAILED', 'APP 分流配置无效，已拒绝创建 VPN', false);
       hilog.warn(DOMAIN, TAG, 'VPN_START_REJECTED invalid_app_routing');
+      this.stopOwnExtension();
+      return;
+    }
+    if (!supportsVpnApplicationRouting(this.appRoutingMode, deviceInfo.sdkApiVersion)) {
+      VpnRuntimeState.publish('FAILED',
+        `APP 分流隔离需要 API ${VPN_APPLICATION_ISOLATION_MIN_API_VERSION} 或更高版本`, false);
+      hilog.warn(DOMAIN, TAG, 'VPN_START_REJECTED app_routing_isolation_unavailable api=%{public}d',
+        deviceInfo.sdkApiVersion);
       this.stopOwnExtension();
       return;
     }
@@ -210,6 +224,25 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     }
     hilog.info(DOMAIN, TAG, 'PHASE3_PROTECT_OK');
 
+    // HarmonyOS multi-VPN marks only accepted App UID ranges. Whitelist mode
+    // needs that isolation, while blacklist mode must use the global vpn-tun
+    // path so unblocked system-forwarded Android container traffic is routed.
+    const isolatedAppRouting: boolean = usesIsolatedVpnApplicationRouting(this.appRoutingMode);
+    if (!supportsVpnApplicationRouting(this.appRoutingMode, deviceInfo.sdkApiVersion)) {
+      throw new Error(
+        `App routing isolation requires API ${VPN_APPLICATION_ISOLATION_MIN_API_VERSION} or newer`);
+    }
+    let vpnId: string | undefined = undefined;
+    if (isolatedAppRouting) {
+      try {
+        vpnId = await vpnConnection.generateVpnId();
+      } catch (error) {
+        const generateError: BusinessError = error as BusinessError;
+        throw new Error(`VPN ID generation failed: ${generateError.code}`);
+      }
+      this.vpnId = vpnId;
+    }
+
     const appRouting: VpnApplicationRouting = buildVpnApplicationRouting(
       this.appRoutingMode,
       this.selectedApplications
@@ -223,7 +256,7 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       ],
       routes: [
         {
-          interface: 'vpn-tun',
+          interface: vpnApplicationRouteInterface(this.appRoutingMode),
           destination: {
             address: { address: '0.0.0.0', family: 1 },
             prefixLength: 0
@@ -244,6 +277,9 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     // exists even if its value is an empty array, which can make a non-empty
     // blacklist ineffective and route excluded Apps into the VPN.
     applyVpnApplicationRouting(config, appRouting);
+    if (vpnId !== undefined) {
+      applyVpnApplicationIsolation(config, vpnId);
+    }
     let tunFd: number;
     try {
       tunFd = await vpnConnection.create(config);
@@ -252,8 +288,10 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
       throw new Error(`VPN create failed: ${createError.code}`);
     }
     this.vpnCreated = true;
-    hilog.info(DOMAIN, TAG, 'PHASE3_VPN_CREATE_OK mtu=%{public}d routing_mode=%{public}s selected_apps=%{public}d',
-      handshake.mtu, this.appRoutingMode, this.selectedApplications.length);
+    hilog.info(DOMAIN, TAG,
+      'PHASE3_VPN_CREATE_OK mtu=%{public}d routing_mode=%{public}s selected_apps=%{public}d routing_path=%{public}s',
+      handshake.mtu, this.appRoutingMode, this.selectedApplications.length,
+      isolatedAppRouting ? 'isolated' : 'global');
 
     const startResult: number = hnbNative.startPacketPump(tunFd);
     if (startResult !== 0) {
@@ -372,14 +410,18 @@ export default class HarmonyNetBridgeVpnExtensionAbility extends VpnExtensionAbi
     hnbNative.stopPacketPump();
     this.pumpStarted = false;
     const vpnConnection: vpnExtension.VpnConnection | undefined = this.vpnConnection;
+    const vpnId: string | undefined = this.vpnId;
     const shouldDestroyVpn: boolean = this.vpnCreated && vpnConnection !== undefined;
     this.vpnCreated = false;
     this.vpnConnection = undefined;
+    this.vpnId = undefined;
     const controlSession: VpnControlSession | undefined = this.controlSession;
     this.controlSession = undefined;
     if (shouldDestroyVpn && vpnConnection !== undefined) {
       try {
-        await completeWithin(vpnConnection.destroy(), VPN_DESTROY_TIMEOUT_MS, 'destroy VPN connection');
+        const destroyPromise: Promise<void> = vpnId === undefined ?
+          vpnConnection.destroy() : vpnConnection.destroy(vpnId);
+        await completeWithin(destroyPromise, VPN_DESTROY_TIMEOUT_MS, 'destroy VPN connection');
         hilog.info(DOMAIN, TAG, 'PHASE3_VPN_DESTROY_OK');
       } catch (error) {
         const destroyError: Error = error as Error;

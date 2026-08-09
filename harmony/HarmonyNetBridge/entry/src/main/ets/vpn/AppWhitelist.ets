@@ -11,6 +11,7 @@ const ROUTING_MODE_KEY: string = 'routing_mode';
 const MIN_BUNDLE_NAME_LENGTH: number = 7;
 const MAX_BUNDLE_NAME_LENGTH: number = 128;
 export const ALWAYS_TUNNELED_BUNDLE_NAME: string = 'io.github.realskyrin.harmonynetbridge';
+export const VPN_APPLICATION_ISOLATION_MIN_API_VERSION: number = 20;
 
 export enum AppRoutingMode {
   WHITELIST = 'whitelist',
@@ -35,6 +36,26 @@ export class VpnApplicationRouting {
     this.trustedApplications = trustedApplications;
     this.blockedApplications = blockedApplications;
   }
+}
+
+interface VpnConfigWithIdentity extends vpnExtension.VpnConfig {
+  vpnId?: string;
+}
+
+export function supportsVpnApplicationIsolation(sdkApiVersion: number): boolean {
+  return sdkApiVersion >= VPN_APPLICATION_ISOLATION_MIN_API_VERSION;
+}
+
+export function usesIsolatedVpnApplicationRouting(mode: AppRoutingMode): boolean {
+  return mode === AppRoutingMode.WHITELIST;
+}
+
+export function supportsVpnApplicationRouting(mode: AppRoutingMode, sdkApiVersion: number): boolean {
+  return !usesIsolatedVpnApplicationRouting(mode) || supportsVpnApplicationIsolation(sdkApiVersion);
+}
+
+export function vpnApplicationRouteInterface(mode: AppRoutingMode): string {
+  return usesIsolatedVpnApplicationRouting(mode) ? '' : 'vpn-tun';
 }
 
 function isAsciiLetter(code: number): boolean {
@@ -150,6 +171,26 @@ export function applyVpnApplicationRouting(config: vpnExtension.VpnConfig,
     config.trustedApplications = routing.trustedApplications;
   } else if (routing.blockedApplications !== undefined) {
     config.blockedApplications = routing.blockedApplications;
+  }
+}
+
+// Whitelist routing supplies a generated vpnId to select HarmonyOS' isolated
+// multi-VPN path. Unlike the legacy global vpn-tun path, that path marks only
+// the configured App UID ranges. Leave route interfaces empty so the system
+// can bind them to the generated multitun-vpnN interface.
+export function applyVpnApplicationIsolation(config: vpnExtension.VpnConfig, vpnId: string): void {
+  const normalizedVpnId: string = vpnId.trim();
+  if (normalizedVpnId.length === 0) {
+    throw new Error('generated VPN ID is empty');
+  }
+  const isolatedConfig: VpnConfigWithIdentity = config as VpnConfigWithIdentity;
+  isolatedConfig.vpnId = normalizedVpnId;
+  const routes: vpnExtension.RouteInfo[] | undefined = config.routes;
+  if (routes === undefined) {
+    return;
+  }
+  for (let index: number = 0; index < routes.length; index++) {
+    routes[index].interface = '';
   }
 }
 

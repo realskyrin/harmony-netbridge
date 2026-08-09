@@ -2,6 +2,7 @@ import { describe, expect, it } from '@ohos/hypium';
 import { vpnExtension } from '@kit.NetworkKit';
 import {
   ALWAYS_TUNNELED_BUNDLE_NAME,
+  applyVpnApplicationIsolation,
   applyVpnApplicationRouting,
   AppRoutingMode,
   applicationUsesTunnel,
@@ -12,6 +13,10 @@ import {
   isValidBundleName,
   normalizeBundleName,
   normalizeSelectedApplications,
+  supportsVpnApplicationIsolation,
+  supportsVpnApplicationRouting,
+  usesIsolatedVpnApplicationRouting,
+  vpnApplicationRouteInterface,
   VpnApplicationRouting
 } from '../main/ets/vpn/AppWhitelist';
 
@@ -100,6 +105,43 @@ export default function appWhitelistTest(): void {
       const encodedAllApplications: string = JSON.stringify(allApplicationsConfig);
       expect(encodedAllApplications.indexOf('trustedApplications') < 0).assertTrue();
       expect(encodedAllApplications.indexOf('blockedApplications') < 0).assertTrue();
+    });
+
+    it('usesAnIsolatedVpnIdentityAndSystemResolvedRouteInterface', 0, () => {
+      const config: vpnExtension.VpnConfig = {
+        addresses: [],
+        routes: [
+          {
+            interface: 'vpn-tun',
+            destination: {
+              address: { address: '0.0.0.0', family: 1 },
+              prefixLength: 0
+            },
+            gateway: { address: '0.0.0.0', family: 1 },
+            hasGateway: false,
+            isDefaultRoute: true
+          }
+        ]
+      };
+      applyVpnApplicationIsolation(config, ' test-vpn-id ');
+      expect(JSON.stringify(config).indexOf('"vpnId":"test-vpn-id"') >= 0).assertTrue();
+      expect(config.routes?.[0].interface).assertEqual('');
+    });
+
+    it('requiresApi20ForApplicationIsolation', 0, () => {
+      expect(supportsVpnApplicationIsolation(19)).assertFalse();
+      expect(supportsVpnApplicationIsolation(20)).assertTrue();
+      expect(supportsVpnApplicationIsolation(24)).assertTrue();
+    });
+
+    it('selectsTheVpnRoutingPathByApplicationMode', 0, () => {
+      expect(usesIsolatedVpnApplicationRouting(AppRoutingMode.WHITELIST)).assertTrue();
+      expect(vpnApplicationRouteInterface(AppRoutingMode.WHITELIST)).assertEqual('');
+      expect(usesIsolatedVpnApplicationRouting(AppRoutingMode.BLACKLIST)).assertFalse();
+      expect(vpnApplicationRouteInterface(AppRoutingMode.BLACKLIST)).assertEqual('vpn-tun');
+      expect(supportsVpnApplicationRouting(AppRoutingMode.WHITELIST, 19)).assertFalse();
+      expect(supportsVpnApplicationRouting(AppRoutingMode.WHITELIST, 20)).assertTrue();
+      expect(supportsVpnApplicationRouting(AppRoutingMode.BLACKLIST, 19)).assertTrue();
     });
 
     it('detectsWhetherAnApplicationUsesTunnel', 0, () => {

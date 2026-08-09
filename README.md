@@ -13,7 +13,7 @@ HarmonyNetBridge 是一个面向 HarmonyOS NEXT 开发者的开源 USB 网络桥
 - HTTP 可直接抓取；App 可把 Mac 当前受管 `mitmproxy-ca-cert.cer` 经现有 hdc 通道保存到手机，并用系统证书管理器打开。最终安装与信任仍由用户在系统界面确认。
 - 抓包模式拦截 TCP 80/443/8080/8443；UDP/443 被拒绝以促使 QUIC 回退 TCP，其他 UDP、DNS 和非 HTTP TCP 仍按标准模式转发。
 - 独立的 HNB/1 Control/Data TCP 连接，以随机 session token 关联，避免控制帧与高频 packet 相互阻塞。
-- HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由。
+- HarmonyOS `VpnExtensionAbility`、用户 VPN 授权、隧道 socket `protect()` 与默认 IPv4 路由；白名单使用独立 `vpnId` 和系统分配的 `multitun-vpnN`，只标记允许的 App UID；黑名单使用全局 `vpn-tun`，让 Android 兼容容器等系统转发流量也进入 Tunnel，再由 `blockedApplications` 排除黑名单中的鸿蒙 App。
 - App 设置页通过 Tab 切换白名单或黑名单模式，APP 分流卡片只展示已选 APP；点击“名单管理”后在二级 Bottom Sheet 中搜索和勾选完整已安装 APP 列表。HarmonyNetBridge 自身不显示在名单中并始终进入 Tunnel。两种模式共用同一份选中结果：白名单把本应用和选中 Bundle 写入 `VpnConfig.trustedApplications`，黑名单把选中 Bundle 写入 `blockedApplications`，且始终排除本应用。
 - App 会以 0.5/1/2/4 秒上限退避探测 Mac 服务；先打开 App、随后启动 Mac Bridge，或重新插入数据线后，首页连接状态都会自动更新。VPN Tunnel 接管期间不会抢占连接。
 - `start --mtu 576...1500`：由 Mac 在握手中下发 MTU，设备 VPN 与 gVisor relay 使用同一值，默认 1400。
@@ -147,6 +147,7 @@ HarmonyOS App：
 - APP 分流卡片始终只展示已选 APP，不在设置页平铺完整安装列表；点击“名单管理”后，二级 Bottom Sheet 才展示搜索和完整已安装 APP 列表，列表支持下拉刷新，已选 APP 自动排在未选 APP 前面。HarmonyNetBridge 自身会从已安装列表和历史选中结果中移除，并作为隐式规则始终进入 Tunnel。白名单与黑名单 Tab 共用同一份选中结果，切换模式不会复制、清空或替换已选 APP。
 - daemon 优先执行只读 `hdc shell bm dump -a -l` 获取本地化 APP 名称和 Bundle 名称；设备版本不支持标签输出时回退到 `bm dump -a`。列表请求必须携带当前控制会话的随机 token，连接断开后立即失效。
 - 白名单模式让本应用和选中 APP 进入 Tunnel，只下发 `VpnConfig.trustedApplications`；黑名单模式让选中 APP 保持设备直连、其余 APP 进入 Tunnel，只下发 `blockedApplications`，本应用不会被写入黑名单。未启用的可选名单字段会被完全省略，不以空数组传给系统，避免设备错误选择名单策略。
+- 白名单 Tunnel 创建前由系统生成本次会话的 `vpnId`，默认路由接口留空并绑定到独立 `multitun-vpnN`，避免 Android 兼容容器等系统转发流量绕过白名单。黑名单不能使用这一仅按允许 UID 标记的路径，否则 `blockedApplications` 和系统容器流量都不会进入 Tunnel；因此黑名单明确使用 `vpn-tun`，使 Android Chrome 等容器应用按“未被排除”处理。API 20 要求只适用于白名单隔离；旧系统仍可使用黑名单模式。
 - 白名单为空时仍可创建 Tunnel，但只接管作为隐式白名单成员的 HarmonyNetBridge；黑名单为空表示不排除任何 APP，因此所有 APP 都会进入 Tunnel。
 - 默认和旧版本迁移结果均为白名单模式，原有已选 APP 保持不变。Tunnel 活动期间不能修改模式或列表；先关闭 Tunnel，修改后再次开启即可使用新配置。
 - 普通三方手机应用无权直接枚举完整已安装 APP 列表，因此 App 不申请系统级包管理权限；枚举动作由已选设备对应的本机 hdc 完成。
