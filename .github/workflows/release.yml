@@ -134,6 +134,19 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Provide SHA-256 checksum command
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_DIR="${RUNNER_TEMP}/hnb-tools"
+          mkdir -p "${TOOL_DIR}"
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'exec /usr/bin/shasum -a 256 "$@"'
+          } > "${TOOL_DIR}/sha256sum"
+          chmod +x "${TOOL_DIR}/sha256sum"
+          echo "${TOOL_DIR}" >> "${GITHUB_PATH}"
+
       - name: Set up HarmonyOS command-line tools
         id: setup-ohos
         uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2.0.0
