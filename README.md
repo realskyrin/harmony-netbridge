@@ -97,6 +97,8 @@ HarmonyOS App：
 
 未配置签名时会生成 `entry-default-unsigned.hap`；配置个人调试签名后会生成并优先报告 `entry-default-signed.hap`。真机必须安装与你设备匹配的签名 HAP。签名证书、密码和本机路径属于开发者本地配置，不应作为项目发布凭据共享。
 
+正式版本由 `release-v*` 标签触发 GitHub Actions，并从 [CHANGELOG](CHANGELOG.md) 提取发布说明。macOS 和 HarmonyOS 构建均使用 GitHub-hosted Apple Silicon runner；Release 页面固定提供 `harmony-netbridge.zip`（Apple Silicon Mac 二进制）和 `harmony-netbridge-hap.zip`（Release Profile 签名 HAP）。签名材料通过受保护的 GitHub Environment Secret 注入，不进入仓库；首次配置 Environment、签名 Secret 与发版步骤见 [Release workflow](docs/releasing.md)。
+
 构建、安装并打开 App 供真机检查：
 
 ```bash

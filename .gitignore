@@ -3,6 +3,10 @@
 /dist/
 *.test
 
+# Python
+__pycache__/
+*.pyc
+
 # HarmonyOS / DevEco Studio
 **/oh_modules/
 **/node_modules/
@@ -14,6 +18,15 @@
 **/local.properties
 **/.appanalyzer/
 **/.cxx/
+
+# Local signing material
+*.p12
+*.p7b
+*.pfx
+*.jks
+*.keystore
+**/signing-material/
+**/.signing/
 
 # macOS
 .DS_Store

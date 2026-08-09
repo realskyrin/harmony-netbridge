@@ -1,20 +1,6 @@
 {
   "app": {
-    "signingConfigs": [
-      {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": {
-          "certpath": "/Users/yanlin/.ohos/config/default_HarmonyNetBridge_foZXllvocMYNjX4E3QCTH-efa8MTeD6A8aYSVeaYAgs=.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "0000001B4758507AEA28557C409B6247E487806FDF820BAF651CC14463BE8D3A3970FBC0D73DBB7AE96662",
-          "profile": "/Users/yanlin/.ohos/config/default_HarmonyNetBridge_foZXllvocMYNjX4E3QCTH-efa8MTeD6A8aYSVeaYAgs=.p7b",
-          "signAlg": "SHA256withECDSA",
-          "storeFile": "/Users/yanlin/.ohos/config/default_HarmonyNetBridge_foZXllvocMYNjX4E3QCTH-efa8MTeD6A8aYSVeaYAgs=.p12",
-          "storePassword": "0000001B33430E01A607F10457D33EE44C7095CD1B6BB3D2943D25DFD6BF52E9FA066D1DFC60936F08FF24"
-        }
-      }
-    ],
+    "signingConfigs": [],
     "products": [
       {
         "name": "default",

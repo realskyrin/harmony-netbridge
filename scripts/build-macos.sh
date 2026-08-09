@@ -6,6 +6,7 @@ output_dir="${project_root}/bin"
 output_file="${output_dir}/harmony-netbridge"
 commit="unknown"
 go_bin="${GO_BIN:-go}"
+release_version="${HNB_VERSION:-}"
 
 go_is_supported() {
   local version_output
@@ -44,11 +45,20 @@ if git -C "${project_root}" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
   commit="$(git -C "${project_root}" rev-parse --short HEAD)"
 fi
 
+ldflags="-X github.com/realskyrin/harmony-netbridge/internal/version.Commit=${commit}"
+if [[ -n "${release_version}" ]]; then
+  if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "HNB_VERSION must be a stable x.y.z version without a leading v." >&2
+    exit 1
+  fi
+  ldflags="${ldflags} -X github.com/realskyrin/harmony-netbridge/internal/version.Version=${release_version}"
+fi
+
 mkdir -p "${output_dir}"
 cd "${project_root}"
 GOOS=darwin GOARCH=arm64 "${go_bin}" build \
   -trimpath \
-  -ldflags "-X github.com/realskyrin/harmony-netbridge/internal/version.Commit=${commit}" \
+  -ldflags "${ldflags}" \
   -o "${output_file}" \
   ./cmd/harmony-netbridge
 

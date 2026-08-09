@@ -1,0 +1,277 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'release-v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, versions, changelog, and signing hygiene
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#release-v}"
+          if [[ "${TAG}" == "${VERSION}" ]]; then
+            echo "Tag must start with release-v." >&2
+            exit 1
+          fi
+          python3 scripts/release.py validate "${VERSION}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  build-macos:
+    name: Build macOS binary
+    needs: validate
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+          cache: true
+
+      - name: Test macOS daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race ./...
+          go vet ./...
+
+      - name: Build and package macOS binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          HNB_VERSION="${VERSION}" ./scripts/build-macos.sh
+
+          EXPECTED_COMMIT="$(git rev-parse --short HEAD)"
+          EXPECTED_VERSION="harmony-netbridge ${VERSION} (${EXPECTED_COMMIT})"
+          ACTUAL_VERSION="$(./bin/harmony-netbridge --version)"
+          if [[ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]]; then
+            echo "Unexpected binary version: ${ACTUAL_VERSION}" >&2
+            exit 1
+          fi
+
+          codesign --force --sign - ./bin/harmony-netbridge
+          codesign --verify --strict --verbose=2 ./bin/harmony-netbridge
+          /usr/bin/zip -j -X harmony-netbridge.zip ./bin/harmony-netbridge
+          [[ "$(unzip -Z1 harmony-netbridge.zip)" == "harmony-netbridge" ]]
+          shasum -a 256 harmony-netbridge.zip
+
+      - name: Upload macOS release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: harmony-netbridge-macos-${{ needs.validate.outputs.version }}
+          path: harmony-netbridge.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  build-harmony:
+    name: Build signed HarmonyOS HAP
+    needs: validate
+    runs-on: macos-14
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+    env:
+      HNB_OHOS_CLI_VERSION: '26.0.0.621'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up HarmonyOS command-line tools
+        id: setup-ohos
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2.0.0
+        with:
+          version: ${{ env.HNB_OHOS_CLI_VERSION }}
+          cache: true
+
+      - name: Configure HarmonyOS toolchain paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_ROOT="${HOME}/ohos-sdk/command-line-tools"
+          {
+            echo "HNB_OHPM=${TOOL_ROOT}/bin/ohpm"
+            echo "HNB_HVIGORW=${TOOL_ROOT}/bin/hvigorw"
+            echo "HNB_NODE_HOME=${TOOL_ROOT}/tool/node"
+            echo "HNB_HAP_SIGN_TOOL=${TOOL_ROOT}/sdk/default/openharmony/toolchains/lib/hap-sign-tool.jar"
+          } >> "${GITHUB_ENV}"
+
+      - name: Check HarmonyOS toolchain
+        shell: bash
+        env:
+          INSTALLED_API_VERSION: ${{ steps.setup-ohos.outputs.api-version }}
+          INSTALLED_SDK_VERSION: ${{ steps.setup-ohos.outputs.sdk-version }}
+        run: |
+          set -euo pipefail
+          [[ "${INSTALLED_API_VERSION}" == "26" ]]
+          [[ "${INSTALLED_SDK_VERSION}" == 26.0.0.* ]]
+          [[ -x "${HNB_OHPM}" ]]
+          [[ -x "${HNB_HVIGORW}" ]]
+          [[ -x "${HNB_NODE_HOME}/bin/node" ]]
+          [[ -f "${HNB_HAP_SIGN_TOOL}" ]]
+          command -v java
+          python3 --version
+          java -version
+          "${HNB_OHPM}" --version
+          "${HNB_NODE_HOME}/bin/node" --version
+          NODE_HOME="${HNB_NODE_HOME}" "${HNB_HVIGORW}" --version
+
+      - name: Install release signing configuration
+        shell: bash
+        env:
+          OHOS_SIGNING_BUNDLE_BASE64: ${{ secrets.OHOS_SIGNING_BUNDLE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${OHOS_SIGNING_BUNDLE_BASE64:-}" ]]; then
+            echo "OHOS_SIGNING_BUNDLE_BASE64 is not configured in the release environment." >&2
+            exit 1
+          fi
+          SIGNING_TEMP="$(mktemp -d "${RUNNER_TEMP}/hnb-signing.XXXXXX")"
+          echo "HNB_SIGNING_TEMP=${SIGNING_TEMP}" >> "${GITHUB_ENV}"
+          printf '%s' "${OHOS_SIGNING_BUNDLE_BASE64}" | \
+            python3 scripts/ohos_signing_secret.py install \
+              --build-profile harmony/HarmonyNetBridge/build-profile.json5 \
+              --output-dir "${SIGNING_TEMP}/release" \
+              --hap-sign-tool "${HNB_HAP_SIGN_TOOL}"
+
+      - name: Run HarmonyOS tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/test-harmony.sh
+
+      - name: Build, verify, and package signed HAP
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          HNB_BUILD_MODE=release HNB_REQUIRE_SIGNED=1 ./scripts/build-harmony.sh
+
+          HAP="harmony/HarmonyNetBridge/entry/build/default/outputs/default/entry-default-signed.hap"
+          python3 scripts/ohos_signing_secret.py verify-hap \
+            --hap "${HAP}" \
+            --hap-sign-tool "${HNB_HAP_SIGN_TOOL}"
+          unzip -p "${HAP}" module.json | grep -Fq "\"versionName\":\"${VERSION}\""
+
+          cp "${HAP}" harmony-netbridge.hap
+          /usr/bin/zip -j -X harmony-netbridge-hap.zip harmony-netbridge.hap
+          [[ "$(unzip -Z1 harmony-netbridge-hap.zip)" == "harmony-netbridge.hap" ]]
+          shasum -a 256 harmony-netbridge-hap.zip
+
+      - name: Upload HarmonyOS release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: harmony-netbridge-hap-${{ needs.validate.outputs.version }}
+          path: harmony-netbridge-hap.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${HNB_SIGNING_TEMP:-}" ]]; then
+            python3 scripts/ohos_signing_secret.py cleanup \
+              --build-profile harmony/HarmonyNetBridge/build-profile.json5 \
+              --output-dir "${HNB_SIGNING_TEMP}" \
+              --allowed-root "${RUNNER_TEMP}"
+          fi
+
+  release:
+    name: Create GitHub Release
+    needs: [validate, build-macos, build-harmony]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout changelog
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download macOS asset
+        uses: actions/download-artifact@v8
+        with:
+          name: harmony-netbridge-macos-${{ needs.validate.outputs.version }}
+          path: dist
+
+      - name: Download HarmonyOS asset
+        uses: actions/download-artifact@v8
+        with:
+          name: harmony-netbridge-hap-${{ needs.validate.outputs.version }}
+          path: dist
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -f dist/harmony-netbridge.zip ]]
+          [[ -f dist/harmony-netbridge-hap.zip ]]
+          python3 scripts/release.py notes "${VERSION}" release-notes.md
+          {
+            echo
+            echo "### SHA-256"
+            echo
+            echo '```text'
+            sha256sum dist/harmony-netbridge.zip dist/harmony-netbridge-hap.zip
+            echo '```'
+          } >> release-notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: v${{ needs.validate.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/harmony-netbridge.zip
+            dist/harmony-netbridge-hap.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
