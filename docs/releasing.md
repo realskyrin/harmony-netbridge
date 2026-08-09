@@ -11,7 +11,7 @@ The workflow does not update or dispatch a Homebrew repository.
 
 ### 1. Add the protected release environment
 
-In **Settings → Environments**, create an environment named `release`. Add a required reviewer so release signing material is not exposed to a job until the deployment is approved.
+In **Settings → Environments**, create an environment named `release`. Configure custom deployment branches and tags so only tags matching `release-v*` and the `main` branch can deploy. `main` is needed only for the manual retry path below; the workflow still checks out and validates the requested release tag before using signing material. A required reviewer is optional; enabling one makes each release wait for manual approval.
 
 In **Settings → Actions → General**, allow workflows to create releases with `GITHUB_TOKEN`. The workflow requests `contents: write` only in its final publishing job.
 
@@ -61,10 +61,21 @@ Before creating the tag:
 
    ```bash
    git tag release-vx.y.z
-   git push origin main release-vx.y.z
+   git push --atomic origin main release-vx.y.z
    ```
 
 The tag starts both builds in parallel on GitHub-hosted `macos-14` runners. The publishing job runs only after both assets pass their tests, version checks, signature verification, and packaging checks. Release notes are taken from the matching `CHANGELOG.md` section and include both asset SHA-256 values.
+
+If GitHub accepted an existing tag but did not create a workflow run, retry that exact tag without moving or recreating it:
+
+```bash
+gh workflow run Release \
+  --repo realskyrin/harmony-netbridge \
+  --ref main \
+  -f tag=release-vx.y.z
+```
+
+The manual run executes the workflow definition from `main`, but every build and release step checks out the supplied tag. The validation job fails before signing if the tag name, checked-out commit, version metadata, or changelog do not match.
 
 ## Install downloaded assets
 

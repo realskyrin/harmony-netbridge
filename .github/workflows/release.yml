@@ -5,9 +5,14 @@ on:
     tags:
       - 'release-v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -18,26 +23,35 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Validate tag, versions, changelog, and signing hygiene
         id: version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           VERSION="${TAG#release-v}"
           if [[ "${TAG}" == "${VERSION}" ]]; then
             echo "Tag must start with release-v." >&2
             exit 1
           fi
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-list -n 1 "${TAG}")" ]]; then
+            echo "Checked-out commit does not match ${TAG}." >&2
+            exit 1
+          fi
           python3 scripts/release.py validate "${VERSION}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
   build-macos:
     name: Build macOS binary
@@ -49,6 +63,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.validate.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -109,6 +124,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.validate.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -230,6 +246,7 @@ jobs:
       - name: Checkout changelog
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.validate.outputs.tag }}
           persist-credentials: false
 
       - name: Download macOS asset
@@ -265,7 +282,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.validate.outputs.tag }}
           name: v${{ needs.validate.outputs.version }}
           body_path: release-notes.md
           draft: false
