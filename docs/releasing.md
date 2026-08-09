@@ -3,7 +3,7 @@
 HarmonyNetBridge publishes from tags named `release-v<version>`. The workflow creates one GitHub Release with exactly these downloadable assets:
 
 - `harmony-netbridge.zip`: an ad-hoc-signed Apple Silicon macOS CLI binary named `harmony-netbridge`.
-- `harmony-netbridge-hap.zip`: a release-signed HarmonyOS HAP named `harmony-netbridge.hap`.
+- `harmony-netbridge.hap.zip`: a release-mode HarmonyOS HAP named `harmony-netbridge.hap`, signed with a device-bound debug Profile for `hdc` installation.
 
 The workflow does not update or dispatch a Homebrew repository.
 
@@ -21,17 +21,19 @@ The HarmonyOS job runs on the standard GitHub-hosted Apple Silicon `macos-14` im
 
 Each fresh runner installs Temurin Java 21 and the HarmonyOS `26.0.0.621` Command Line Tools through the commit-pinned `ErBWs/setup-ohos` action. The downloaded SDK is cached between workflow runs. No DevEco Studio installation or runner registration is required in GitHub; the first uncached build will take longer while the toolchain is downloaded.
 
-### 3. Upload the HarmonyOS release signing secret
+### 3. Upload the HarmonyOS device signing secret
 
-The current automatic personal signature is a `debug` Profile and is intentionally rejected by the release workflow. Create or obtain all of the following for bundle `io.github.realskyrin.harmonynetbridge` in AppGallery Connect:
+The downloadable HAP is intended for `hdc` installation on registered development devices. A HarmonyOS release Profile is for trusted store distribution and contains no debugging device list; although its cryptographic signature can verify successfully, a development device can reject that HAP with install error `9568322` (`not trusted app source`). Use a debug certificate and debug Profile instead.
 
-- release keystore (`.p12`), including its store password;
+Create or obtain all of the following for bundle `io.github.realskyrin.harmonynetbridge` in AppGallery Connect:
+
+- debug keystore (`.p12`), including its store password;
 - key alias and key password;
-- application release certificate (`.cer`);
-- application release Profile (`.p7b`);
+- application debug certificate (`.cer`);
+- application debug Profile (`.p7b`) containing every device that should install the GitHub Release HAP;
 - the DevEco `material` directory stored beside the `.p12`, which decrypts the ciphertext password fields written by DevEco Studio.
 
-Configure these as the `default` signing configuration in DevEco Studio. Then run this command from the repository root while that local `build-profile.json5` contains the release configuration:
+Configure these as the `default` signing configuration in DevEco Studio. Then run this command from the repository root while that local `build-profile.json5` contains the debug configuration:
 
 ```bash
 python3 scripts/ohos_signing_secret.py upload \
@@ -40,7 +42,9 @@ python3 scripts/ohos_signing_secret.py upload \
   --environment release
 ```
 
-The helper verifies that the Profile type is `release`, packages the configuration and signing files in memory, and uploads one environment secret named `OHOS_SIGNING_BUNDLE_BASE64`. It does not print the secret. The encoded bundle must stay below GitHub's 48 KB secret limit.
+The helper verifies the `debug` Profile type, exact bundle name, and a nonempty registered-device list. It packages the configuration and signing files in memory and uploads one environment secret named `OHOS_DEBUG_SIGNING_BUNDLE_BASE64`; it does not print the secret. The encoded bundle must stay below GitHub's 48 KB secret limit.
+
+The workflow still compiles the application with `HNB_BUILD_MODE=release`; `debug` here describes the device-bound installation Profile, not the build optimization mode. Regenerate and upload the secret whenever the set of allowed development devices changes.
 
 Never commit the populated `signingConfigs` block. The repository version of `build-profile.json5` must keep `"signingConfigs": []`; `scripts/release.py validate` enforces this before any release build starts.
 
@@ -89,8 +93,8 @@ install -m 755 harmony-netbridge /usr/local/bin/harmony-netbridge
 HarmonyOS development device:
 
 ```bash
-unzip harmony-netbridge-hap.zip
+unzip harmony-netbridge.hap.zip
 hdc install -r harmony-netbridge.hap
 ```
 
-The HAP is intended for this developer-tool workflow. Device policy, Developer Mode, USB debugging, and `hdc` authorization can still control whether sideload installation is allowed.
+The HAP installs only on devices present in its debug Profile. Device policy, Developer Mode, USB debugging, and `hdc` authorization can still control whether sideload installation is allowed.

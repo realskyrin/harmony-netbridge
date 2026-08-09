@@ -111,7 +111,7 @@ jobs:
           retention-days: 30
 
   build-harmony:
-    name: Build signed HarmonyOS HAP
+    name: Build hdc-installable HarmonyOS HAP
     needs: validate
     runs-on: macos-14
     timeout-minutes: 60
@@ -186,28 +186,29 @@ jobs:
           "${HNB_NODE_HOME}/bin/node" --version
           NODE_HOME="${HNB_NODE_HOME}" "${HNB_HVIGORW}" --version
 
-      - name: Install release signing configuration
+      - name: Install device-bound debug signing configuration
         shell: bash
         env:
-          OHOS_SIGNING_BUNDLE_BASE64: ${{ secrets.OHOS_SIGNING_BUNDLE_BASE64 }}
+          OHOS_DEBUG_SIGNING_BUNDLE_BASE64: ${{ secrets.OHOS_DEBUG_SIGNING_BUNDLE_BASE64 }}
         run: |
           set -euo pipefail
-          if [[ -z "${OHOS_SIGNING_BUNDLE_BASE64:-}" ]]; then
-            echo "OHOS_SIGNING_BUNDLE_BASE64 is not configured in the release environment." >&2
+          if [[ -z "${OHOS_DEBUG_SIGNING_BUNDLE_BASE64:-}" ]]; then
+            echo "OHOS_DEBUG_SIGNING_BUNDLE_BASE64 is not configured in the release environment." >&2
             exit 1
           fi
           SIGNING_TEMP="$(mktemp -d "${RUNNER_TEMP}/hnb-signing.XXXXXX")"
           echo "HNB_SIGNING_TEMP=${SIGNING_TEMP}" >> "${GITHUB_ENV}"
-          printf '%s' "${OHOS_SIGNING_BUNDLE_BASE64}" | \
+          printf '%s' "${OHOS_DEBUG_SIGNING_BUNDLE_BASE64}" | \
             python3 scripts/ohos_signing_secret.py install \
               --build-profile harmony/HarmonyNetBridge/build-profile.json5 \
-              --output-dir "${SIGNING_TEMP}/release" \
+              --output-dir "${SIGNING_TEMP}/debug" \
               --hap-sign-tool "${HNB_HAP_SIGN_TOOL}"
 
       - name: Run HarmonyOS tests
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
           ./scripts/test-harmony.sh
 
       - name: Build, verify, and package signed HAP
@@ -225,15 +226,15 @@ jobs:
           unzip -p "${HAP}" module.json | grep -Fq "\"versionName\":\"${VERSION}\""
 
           cp "${HAP}" harmony-netbridge.hap
-          /usr/bin/zip -j -X harmony-netbridge-hap.zip harmony-netbridge.hap
-          [[ "$(unzip -Z1 harmony-netbridge-hap.zip)" == "harmony-netbridge.hap" ]]
-          shasum -a 256 harmony-netbridge-hap.zip
+          /usr/bin/zip -j -X harmony-netbridge.hap.zip harmony-netbridge.hap
+          [[ "$(unzip -Z1 harmony-netbridge.hap.zip)" == "harmony-netbridge.hap" ]]
+          shasum -a 256 harmony-netbridge.hap.zip
 
       - name: Upload HarmonyOS release asset
         uses: actions/upload-artifact@v7
         with:
           name: harmony-netbridge-hap-${{ needs.validate.outputs.version }}
-          path: harmony-netbridge-hap.zip
+          path: harmony-netbridge.hap.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -281,14 +282,14 @@ jobs:
         run: |
           set -euo pipefail
           [[ -f dist/harmony-netbridge.zip ]]
-          [[ -f dist/harmony-netbridge-hap.zip ]]
+          [[ -f dist/harmony-netbridge.hap.zip ]]
           python3 scripts/release.py notes "${VERSION}" release-notes.md
           {
             echo
             echo "### SHA-256"
             echo
             echo '```text'
-            sha256sum dist/harmony-netbridge.zip dist/harmony-netbridge-hap.zip
+            sha256sum dist/harmony-netbridge.zip dist/harmony-netbridge.hap.zip
             echo '```'
           } >> release-notes.md
 
@@ -303,6 +304,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/harmony-netbridge.zip
-            dist/harmony-netbridge-hap.zip
+            dist/harmony-netbridge.hap.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

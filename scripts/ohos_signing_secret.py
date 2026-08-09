@@ -19,7 +19,9 @@ import tempfile
 from typing import Any
 
 
-SECRET_NAME = "OHOS_SIGNING_BUNDLE_BASE64"
+SECRET_NAME = "OHOS_DEBUG_SIGNING_BUNDLE_BASE64"
+EXPECTED_PROFILE_TYPE = "debug"
+EXPECTED_BUNDLE_NAME = "io.github.realskyrin.harmonynetbridge"
 SECRET_SIZE_LIMIT = 48 * 1024
 MAX_ARCHIVE_MEMBERS = 128
 MAX_EXTRACTED_BYTES = 4 * 1024 * 1024
@@ -136,7 +138,13 @@ def resolve_java() -> str:
     return java
 
 
-def verify_profile(profile: Path, hap_sign_tool: Path, expected_type: str) -> None:
+def verify_profile(
+    profile: Path,
+    hap_sign_tool: Path,
+    expected_type: str,
+    expected_bundle_name: str,
+    require_registered_devices: bool,
+) -> dict[str, Any]:
     java = resolve_java()
     with tempfile.TemporaryDirectory(prefix="hnb-profile-") as directory:
         output = Path(directory) / "profile.json"
@@ -159,13 +167,32 @@ def verify_profile(profile: Path, hap_sign_tool: Path, expected_type: str) -> No
             raise SigningBundleError("The HarmonyOS profile could not be verified.")
         try:
             result = json.loads(output.read_text(encoding="utf-8"))
-            profile_type = result["content"]["type"]
+            content = result["content"]
+            profile_type = content["type"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
             raise SigningBundleError("The verified HarmonyOS profile has no readable type.") from error
+        if not isinstance(content, dict):
+            raise SigningBundleError("The verified HarmonyOS profile content is malformed.")
     if profile_type != expected_type:
         raise SigningBundleError(
             f"The HarmonyOS profile type is {profile_type!r}; {expected_type!r} is required."
         )
+    bundle_info = content.get("bundle-info")
+    if not isinstance(bundle_info, dict) or bundle_info.get("bundle-name") != expected_bundle_name:
+        raise SigningBundleError(
+            f"The HarmonyOS profile does not match bundle {expected_bundle_name!r}."
+        )
+    if require_registered_devices:
+        debug_info = content.get("debug-info")
+        device_ids = debug_info.get("device-ids") if isinstance(debug_info, dict) else None
+        if not isinstance(device_ids, list) or not any(
+            isinstance(device_id, str) and device_id for device_id in device_ids
+        ):
+            raise SigningBundleError(
+                "The HarmonyOS debug profile has no registered devices; "
+                "an hdc-installable HAP requires the target device in the profile."
+            )
+    return content
 
 
 def _selected_signing_config(build_profile: Path) -> tuple[dict[str, Any], dict[str, Path]]:
@@ -233,9 +260,19 @@ def _add_bytes(archive: tarfile.TarFile, name: str, content: bytes, mode: int = 
     archive.addfile(info, io.BytesIO(content))
 
 
-def create_bundle(build_profile: Path, hap_sign_tool: Path, expected_type: str = "release") -> bytes:
+def create_bundle(
+    build_profile: Path,
+    hap_sign_tool: Path,
+    expected_type: str = EXPECTED_PROFILE_TYPE,
+) -> bytes:
     config, paths = _selected_signing_config(build_profile)
-    verify_profile(paths["profile"], hap_sign_tool, expected_type)
+    verify_profile(
+        paths["profile"],
+        hap_sign_tool,
+        expected_type,
+        EXPECTED_BUNDLE_NAME,
+        require_registered_devices=True,
+    )
 
     source_material = config["material"]
     manifest_material = {
@@ -353,7 +390,7 @@ def install_bundle(
     destination: Path,
     build_profile: Path,
     hap_sign_tool: Path,
-    expected_type: str = "release",
+    expected_type: str = EXPECTED_PROFILE_TYPE,
 ) -> None:
     destination = destination.resolve()
     destination_existed = destination.exists()
@@ -374,7 +411,13 @@ def install_bundle(
 
         signing_root = destination.resolve() / "signing"
         profile = signing_root / "signing.p7b"
-        verify_profile(profile, hap_sign_tool, expected_type)
+        verify_profile(
+            profile,
+            hap_sign_tool,
+            expected_type,
+            EXPECTED_BUNDLE_NAME,
+            require_registered_devices=True,
+        )
 
         installed_material = copy.deepcopy(material)
         installed_material["certpath"] = str(signing_root / "signing.cer")
@@ -406,7 +449,11 @@ def install_bundle(
         raise
 
 
-def verify_hap(hap: Path, hap_sign_tool: Path, expected_type: str = "release") -> None:
+def verify_hap(
+    hap: Path,
+    hap_sign_tool: Path,
+    expected_type: str = EXPECTED_PROFILE_TYPE,
+) -> None:
     if not hap.is_file():
         raise SigningBundleError(f"Signed HAP not found: {hap}")
     java = resolve_java()
@@ -432,7 +479,13 @@ def verify_hap(hap: Path, hap_sign_tool: Path, expected_type: str = "release") -
         )
         if completed.returncode != 0 or not certificate.is_file() or not profile.is_file():
             raise SigningBundleError("The signed HAP failed hap-sign-tool verification.")
-        verify_profile(profile, hap_sign_tool, expected_type)
+        verify_profile(
+            profile,
+            hap_sign_tool,
+            expected_type,
+            EXPECTED_BUNDLE_NAME,
+            require_registered_devices=True,
+        )
 
 
 def sanitize_build_profile(build_profile: Path) -> None:
@@ -457,7 +510,7 @@ def cleanup_signing(destination: Path, allowed_root: Path, build_profile: Path) 
 def command_upload(args: argparse.Namespace) -> None:
     build_profile = args.build_profile.resolve()
     tool = resolve_hap_sign_tool(args.hap_sign_tool)
-    encoded = create_bundle(build_profile, tool, expected_type="release")
+    encoded = create_bundle(build_profile, tool, expected_type=EXPECTED_PROFILE_TYPE)
     gh = shutil.which("gh")
     if gh is None:
         raise SigningBundleError("GitHub CLI is required to upload the signing secret.")
@@ -484,15 +537,15 @@ def command_install(args: argparse.Namespace) -> None:
         args.output_dir,
         args.build_profile,
         tool,
-        expected_type="release",
+        expected_type=EXPECTED_PROFILE_TYPE,
     )
-    print("Installed a verified release signing configuration for this build.")
+    print("Installed a verified device-bound debug signing configuration for this build.")
 
 
 def command_verify_hap(args: argparse.Namespace) -> None:
     tool = resolve_hap_sign_tool(args.hap_sign_tool)
-    verify_hap(args.hap.resolve(), tool, expected_type="release")
-    print("Verified the signed HAP and its embedded release profile.")
+    verify_hap(args.hap.resolve(), tool, expected_type=EXPECTED_PROFILE_TYPE)
+    print("Verified the signed HAP and its embedded device-bound debug profile.")
 
 
 def command_cleanup(args: argparse.Namespace) -> None:
@@ -504,7 +557,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    upload = subparsers.add_parser("upload", help="Verify and upload a release signing bundle.")
+    upload = subparsers.add_parser(
+        "upload", help="Verify and upload a device-bound debug signing bundle."
+    )
     upload.add_argument("--build-profile", type=Path, default=DEFAULT_BUILD_PROFILE)
     upload.add_argument("--hap-sign-tool")
     upload.add_argument("--repo", default="realskyrin/harmony-netbridge")
@@ -517,7 +572,9 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--hap-sign-tool")
     install.set_defaults(handler=command_install)
 
-    verify = subparsers.add_parser("verify-hap", help="Verify a release-signed HAP.")
+    verify = subparsers.add_parser(
+        "verify-hap", help="Verify a device-installable debug-signed HAP."
+    )
     verify.add_argument("--hap", type=Path, required=True)
     verify.add_argument("--hap-sign-tool")
     verify.set_defaults(handler=command_verify_hap)

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Publish the HarmonyOS asset as `harmony-netbridge.hap.zip` and sign its release-mode HAP with a device-bound debug Profile so registered development devices can install it through `hdc`.
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

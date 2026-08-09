@@ -10,6 +10,7 @@ go test -race ./...
 go vet ./...
 GOOS=darwin GOARCH=arm64 go build -trimpath -o "${check_dir}/harmony-netbridge" ./cmd/harmony-netbridge
 "${check_dir}/harmony-netbridge" --help | grep -q 'harmony-netbridge .* proxy'
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 "${project_root}/scripts/test-harmony.sh"
 "${project_root}/scripts/build-harmony.sh"
 
