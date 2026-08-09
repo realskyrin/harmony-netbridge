@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-10
+
+### Changed
+
+- Allow the Release workflow to retry an existing tag safely while checking out and validating that exact tag in every job.
+
 ### Fixed
 
 - Publish the HarmonyOS asset as `harmony-netbridge.hap.zip` and sign its release-mode HAP with a device-bound debug Profile so registered development devices can install it through `hdc`.
+- Provide the checksum command required by HarmonyOS SDK setup on GitHub-hosted macOS runners.
 
 ## [0.4.0] - 2026-08-09
 
