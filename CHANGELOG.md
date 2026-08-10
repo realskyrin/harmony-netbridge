@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-10
+
+### Changed
+
+- Load and cache the installed application list automatically once per bridge session, reject stale session responses, and keep manual refresh available.
+
 ## [0.5.0] - 2026-08-10
 
 ### Changed
