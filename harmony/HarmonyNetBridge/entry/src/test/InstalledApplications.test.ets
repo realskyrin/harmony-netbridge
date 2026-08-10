@@ -4,6 +4,7 @@ import {
   decodeInstalledApplications,
   filterInstalledApplications,
   InstalledApplication,
+  InstalledApplicationLoadCoordinator,
   prioritizeSelectedApplications
 } from '../main/ets/vpn/InstalledApplications';
 import { ALWAYS_TUNNELED_BUNDLE_NAME } from '../main/ets/vpn/AppWhitelist';
@@ -53,6 +54,34 @@ export default function installedApplicationsTest(): void {
       expect(prioritized[2].bundleName).assertEqual('com.example.browser');
       expect(prioritized[3].bundleName).assertEqual('com.example.reader');
       expect(applications[0].bundleName).assertEqual('com.example.browser');
+    });
+
+    it('loadsInstalledApplicationsOncePerBridgeSession', 0, () => {
+      const coordinator: InstalledApplicationLoadCoordinator = new InstalledApplicationLoadCoordinator();
+      const sessionToken: string = '0123456789abcdef0123456789abcdef';
+      expect(coordinator.shouldLoad(sessionToken)).assertEqual(true);
+      expect(coordinator.begin(sessionToken)).assertEqual(true);
+      expect(coordinator.begin(sessionToken)).assertEqual(false);
+      expect(coordinator.complete(sessionToken, sessionToken)).assertEqual(true);
+      expect(coordinator.isLoadedFor(sessionToken)).assertEqual(true);
+      expect(coordinator.shouldLoad(sessionToken)).assertEqual(false);
+      expect(coordinator.begin(sessionToken, true)).assertEqual(true);
+      coordinator.fail(sessionToken);
+      expect(coordinator.hasLoadInProgress()).assertEqual(false);
+    });
+
+    it('rejectsExpiredSessionResponsesAndLoadsTheNewSession', 0, () => {
+      const coordinator: InstalledApplicationLoadCoordinator = new InstalledApplicationLoadCoordinator();
+      const expiredSessionToken: string = '0123456789abcdef0123456789abcdef';
+      const activeSessionToken: string = 'abcdef0123456789abcdef0123456789';
+      expect(coordinator.begin(expiredSessionToken)).assertEqual(true);
+      expect(coordinator.complete(expiredSessionToken, activeSessionToken)).assertEqual(false);
+      expect(coordinator.isLoadedFor(expiredSessionToken)).assertEqual(false);
+      expect(coordinator.shouldLoad(activeSessionToken)).assertEqual(true);
+      expect(coordinator.begin(activeSessionToken)).assertEqual(true);
+      expect(coordinator.complete(activeSessionToken, activeSessionToken)).assertEqual(true);
+      expect(coordinator.isLoadedFor(activeSessionToken)).assertEqual(true);
+      expect(coordinator.begin('invalid-token')).assertEqual(false);
     });
   });
 }

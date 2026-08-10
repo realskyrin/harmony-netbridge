@@ -19,6 +19,7 @@ import {
   applicationDisplayName,
   filterInstalledApplications,
   InstalledApplication,
+  InstalledApplicationLoadCoordinator,
   InstalledApplicationSource,
   prioritizeSelectedApplications
 } from '../vpn/InstalledApplications';
@@ -71,6 +72,8 @@ struct Index {
   @State showSettings: boolean = false;
   @State developerOptionsError: string = '';
   private proxyCertificate: ProxyCertificate = new ProxyCertificate();
+  private installedApplicationLoadCoordinator: InstalledApplicationLoadCoordinator =
+    new InstalledApplicationLoadCoordinator();
   private installedApplicationSource: InstalledApplicationSource = new InstalledApplicationSource();
   private appPickerScroller: Scroller = new Scroller();
   private vpnStatusTimer: number = -1;
@@ -84,9 +87,8 @@ struct Index {
       if (!this.vpnOwnsUsbBridge()) {
         this.proxyEnabled = snapshot.proxyEnabled;
       }
-      if (snapshot.state === BridgeConnectionState.CONNECTED && this.showSettings &&
-        !this.applicationListLoaded && !this.applicationListLoading) {
-        this.loadInstalledApplicationList();
+      if (snapshot.state === BridgeConnectionState.CONNECTED) {
+        this.prepareInstalledApplicationListForSession();
       } else if ((snapshot.state === BridgeConnectionState.ERROR ||
         snapshot.state === BridgeConnectionState.DISCONNECTED) && this.showSettings &&
         !this.applicationListLoaded) {
@@ -600,10 +602,21 @@ struct Index {
     await this.persistSelectedApplications(next);
   }
 
-  private async loadInstalledApplicationList(): Promise<void> {
-    if (this.applicationListLoading) {
+  private prepareInstalledApplicationListForSession(): void {
+    const sessionToken: string = bridgeSession.sessionToken;
+    if (sessionToken.length === 0) {
       return;
     }
+    if (!this.installedApplicationLoadCoordinator.isLoadedFor(sessionToken) &&
+      !this.installedApplicationLoadCoordinator.isLoadingFor(sessionToken)) {
+      this.installedApplications = [];
+      this.applicationListLoaded = false;
+      this.applicationListError = '';
+    }
+    this.loadInstalledApplicationList();
+  }
+
+  private async loadInstalledApplicationList(forceRefresh: boolean = false): Promise<void> {
     const sessionToken: string = bridgeSession.sessionToken;
     if (sessionToken.length === 0) {
       if (this.vpnOwnsUsbBridge()) {
@@ -614,25 +627,44 @@ struct Index {
       await bridgeSession.connect();
       return;
     }
+    if (!this.installedApplicationLoadCoordinator.begin(sessionToken, forceRefresh)) {
+      return;
+    }
     this.applicationListLoading = true;
     this.applicationListError = '';
     try {
-      this.installedApplications = await this.installedApplicationSource.load(sessionToken);
+      const applications: InstalledApplication[] = await this.installedApplicationSource.load(sessionToken);
+      if (!this.installedApplicationLoadCoordinator.complete(sessionToken, bridgeSession.sessionToken)) {
+        return;
+      }
+      this.installedApplications = applications;
       this.applicationListLoaded = true;
     } catch (error) {
+      this.installedApplicationLoadCoordinator.fail(sessionToken);
+      if (bridgeSession.sessionToken !== sessionToken) {
+        return;
+      }
       const loadError: Error = error as Error;
       this.applicationListError = `${loadError.message}。请确认 Mac 端桥接已启动后重试`;
       if (this.installedApplications.length === 0) {
         this.applicationListLoaded = false;
       }
     } finally {
-      this.applicationListLoading = false;
+      this.installedApplicationLoadCoordinator.fail(sessionToken);
+      this.applicationListLoading = this.installedApplicationLoadCoordinator.hasLoadInProgress();
+      const activeSessionToken: string = bridgeSession.sessionToken;
+      if (activeSessionToken.length > 0 && activeSessionToken !== sessionToken &&
+        this.installedApplicationLoadCoordinator.shouldLoad(activeSessionToken)) {
+        setTimeout(() => {
+          this.prepareInstalledApplicationListForSession();
+        }, 0);
+      }
     }
   }
 
   private async refreshInstalledApplicationList(): Promise<void> {
     try {
-      await this.loadInstalledApplicationList();
+      await this.loadInstalledApplicationList(true);
     } finally {
       this.applicationListRefreshing = false;
     }

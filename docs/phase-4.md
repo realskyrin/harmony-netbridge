@@ -14,7 +14,7 @@ Phase 4 在 Phase 3 单设备 IPv4 VPN 上增加受管 mitmweb 抓包，不修�
 - 代理模式拒绝 UDP/443，促使支持回退的客户端从 HTTP/3/QUIC 改用可抓取的 TCP。此行为不会伪装成已抓取 HTTP/3。
 - HNB/1 `HELLO_ACK.capabilities` 增加可选 `proxy`；Harmony App 据此展示模式，并在 Google 与百度之间随机选择纯 HTTP 目标执行链路自检。
 - daemon 在同一 hdc loopback 端口提供唯一只读路径 `/mitmproxy-ca-cert.cer`；仅代理模式可用，并在发送前验证文件是有界的 X.509 CA。其他 proxy 文件、私钥、capture 与 Web UI 信息均不可寻址。
-- daemon 在同一端口提供 `/installed-apps.json`：优先以 `bm dump -a -l` 返回本地化 APP 名称与 Bundle 名称，不支持时回退 `bm dump -a`；接口只接受当前 HNB 控制会话的随机 Bearer token，不申请手机端系统级包管理权限。
+- daemon 在同一端口提供 `/installed-apps.json`：优先以 `bm dump -a -l` 返回本地化 APP 名称与 Bundle 名称，不支持时回退 `bm dump -a`；接口只接受当前 HNB 控制会话的随机 Bearer token，不申请手机端系统级包管理权限。App 在 TUN 尚未开启的 phase1 `HELLO_ACK` 完成后即自动读取一次，并将列表只缓存于当前进程内；新的控制会话会使旧列表失效，过期会话的慢响应不会覆盖新设备结果，设置页下拉刷新仍可强制重新读取。
 - 白名单 VPN 会话使用 API 20 的独立 `vpnId`，精确销毁对应多 VPN 实例；默认路由由系统解析为本次 `multitun-vpnN`。黑名单会话不设置 `vpnId`，使用 `vpn-tun` 处理全部未被 Bundle 黑名单排除的流量，包括 Android 兼容容器。白名单真机回归中，Android Chrome 产生的 `ancowlan0` 包不增加 TUN 或 Mac relay 计数，而隐式白名单成员的 TCP、UDP 和 DNS 自检仍通过；黑名单需要反向验证同一 Chrome 流量会增加 `vpn-tun` 与 Mac relay 计数。
 - App 可将该公共 CA 直接保存到手机应用目录，再以 `general.cer-certificate` 文件类型和只读 URI 授权交给系统证书管理器；不请求 `MANAGE_VPN`，不静默安装证书，也不修改系统信任策略。
 - daemon 正常停止会先停止手机 VPN，再终止本次启动的 mitmweb；异常退出后的下一次启动只在 PID 与完整受管参数均匹配时回收 orphan。

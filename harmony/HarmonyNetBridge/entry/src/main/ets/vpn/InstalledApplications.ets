@@ -10,6 +10,7 @@ const INSTALLED_APPLICATIONS_URL: string = 'http://127.0.0.1:27183/installed-app
 const TIMEOUT_MS: number = 5000;
 const MAX_RESPONSE_CHARACTERS: number = 1024 * 1024;
 const MAX_LABEL_LENGTH: number = 256;
+const SESSION_TOKEN_PATTERN: RegExp = /^[0-9a-f]{32}$/;
 
 export interface InstalledApplication {
   bundleName: string;
@@ -25,6 +26,63 @@ class InstalledApplicationsRequestHeaders {
 
   constructor(sessionToken: string) {
     this.Authorization = `Bearer ${sessionToken}`;
+  }
+}
+
+export function isInstalledApplicationSessionToken(sessionToken: string): boolean {
+  return SESSION_TOKEN_PATTERN.test(sessionToken);
+}
+
+// InstalledApplicationLoadCoordinator keeps the App catalog bound to the
+// phase1 control session that authorized it. Only one hdc-backed request is in
+// flight at a time, and a response from an expired session is never accepted.
+export class InstalledApplicationLoadCoordinator {
+  private loadedSessionToken: string = '';
+  private loadingSessionToken: string = '';
+
+  isLoadedFor(sessionToken: string): boolean {
+    return isInstalledApplicationSessionToken(sessionToken) && this.loadedSessionToken === sessionToken;
+  }
+
+  isLoadingFor(sessionToken: string): boolean {
+    return isInstalledApplicationSessionToken(sessionToken) && this.loadingSessionToken === sessionToken;
+  }
+
+  hasLoadInProgress(): boolean {
+    return this.loadingSessionToken.length > 0;
+  }
+
+  shouldLoad(sessionToken: string, forceRefresh: boolean = false): boolean {
+    if (!isInstalledApplicationSessionToken(sessionToken) || this.hasLoadInProgress()) {
+      return false;
+    }
+    return forceRefresh || !this.isLoadedFor(sessionToken);
+  }
+
+  begin(sessionToken: string, forceRefresh: boolean = false): boolean {
+    if (!this.shouldLoad(sessionToken, forceRefresh)) {
+      return false;
+    }
+    this.loadingSessionToken = sessionToken;
+    return true;
+  }
+
+  complete(sessionToken: string, activeSessionToken: string): boolean {
+    if (this.loadingSessionToken !== sessionToken) {
+      return false;
+    }
+    this.loadingSessionToken = '';
+    if (sessionToken !== activeSessionToken || !isInstalledApplicationSessionToken(activeSessionToken)) {
+      return false;
+    }
+    this.loadedSessionToken = sessionToken;
+    return true;
+  }
+
+  fail(sessionToken: string): void {
+    if (this.loadingSessionToken === sessionToken) {
+      this.loadingSessionToken = '';
+    }
   }
 }
 
@@ -106,7 +164,7 @@ export function prioritizeSelectedApplications(applications: InstalledApplicatio
 
 export class InstalledApplicationSource {
   async load(sessionToken: string): Promise<InstalledApplication[]> {
-    if (!/^[0-9a-f]{32}$/.test(sessionToken)) {
+    if (!isInstalledApplicationSessionToken(sessionToken)) {
       throw new Error('Mac 尚未连接，请稍后重试');
     }
     const request: http.HttpRequest = http.createHttp();
